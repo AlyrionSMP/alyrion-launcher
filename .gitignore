@@ -14,3 +14,4 @@ Thumbs.db
 
 # Bootstrap scratch (never committed)
 .bootstrap/
+.reasonix/
