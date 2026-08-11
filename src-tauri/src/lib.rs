@@ -196,14 +196,17 @@ async fn login_littleskin(
     Ok(())
 }
 
-/// Begin the Ely.by OAuth2 flow (opens the system browser).
+/// Log in with Ely.by using direct credentials (Yggdrasil authserver —
+/// no OAuth app, same as XMCL). Password is sent once over HTTPS and never
+/// stored; only the token is kept.
 #[tauri::command]
-async fn login_elyby(app: tauri::AppHandle) -> Result<(), String> {
+async fn login_elyby(
+    app: tauri::AppHandle,
+    username: String,
+    password: String,
+) -> Result<(), String> {
     let ctx = app.state::<Ctx>();
-    let settings = accounts::load_settings(&ctx.base_dir);
-    let client_id = settings.elyby_client_id.clone();
-    let client_secret = settings.elyby_client_secret.clone();
-    let acc = accounts::elyby_login(&ctx.client, &client_id, &client_secret)
+    let acc = accounts::elyby_authenticate(&ctx.client, &username, &password)
         .await
         .map_err(|e| e.to_string())?;
     let mut accs = ctx.accounts.lock().unwrap();
@@ -274,6 +277,18 @@ fn play(app: tauri::AppHandle) -> Result<(), String> {
             uuid: acc.uuid_dashless(),
             access_token: acc.access_token.clone(),
             user_type: acc.user_type().into(),
+            // Point authlib-injector at the right session server for
+            // third-party online accounts.
+            authserver_url: match acc.provider {
+                accounts::Provider::ElyBy => {
+                    Some(accounts::ELYBY_AUTHSERVER.to_string())
+                }
+                accounts::Provider::LittleSkin => {
+                    let s = accounts::load_settings(&ctx.base_dir);
+                    Some(s.littleskin_server)
+                }
+                accounts::Provider::Offline => None,
+            },
         },
         4096,
     )
@@ -339,13 +354,9 @@ async fn restore_session(app: tauri::AppHandle) {
     };
     // Try refresh (non-fatal on failure; offline accounts stay as-is).
     let refreshed = match acc.provider {
-        accounts::Provider::ElyBy => accounts::elyby_refresh(
-            &ctx.client,
-            &settings.elyby_client_id,
-            &settings.elyby_client_secret,
-            &acc,
-        )
-        .await,
+        accounts::Provider::ElyBy => {
+            accounts::elyby_refresh(&ctx.client, &acc).await
+        }
         accounts::Provider::LittleSkin => {
             accounts::littleskin_refresh(&ctx.client, &settings.littleskin_server, &acc).await
         }

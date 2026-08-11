@@ -404,6 +404,38 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Download authlib-injector.jar (latest release) into the launcher base dir
+/// if it is not already present. Needed for third-party online auth
+/// (Ely.by / LittleSkin session endpoints) at launch.
+pub async fn ensure_authlib_injector(
+    client: &reqwest::Client,
+    base_dir: &Path,
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(Progress),
+) -> Result<(), UpdateError> {
+    let dest = base_dir.join("authlib-injector.jar");
+    if dest.is_file() {
+        return Ok(());
+    }
+    progress(Progress {
+        stage: UpdateStage::Fetching,
+        fraction: 0.0,
+        detail: "Preparing online auth (authlib-injector)…".into(),
+    });
+    let url = "https://github.com/yushijinhun/authlib-injector/releases/download/v1.2.8/authlib-injector-1.2.8.jar";
+    let mut prog = |done: u64, total: u64| {
+        if total > 0 {
+            progress(Progress {
+                stage: UpdateStage::Fetching,
+                fraction: done as f32 / total as f32,
+                detail: format!("authlib-injector.jar ({done}/{total} bytes)"),
+            });
+        }
+        let _ = (done, total);
+    };
+    download_verified(client, url, &dest, None, Some(500_000), cancel, &mut prog).await
+}
+
 /// The core update routine. Uses a sidecar staging dir and atomically swaps
 /// it in at the end, so the game can never observe a half-updated pack.
 ///
@@ -421,6 +453,10 @@ pub async fn update_pack(
         detail: "Checking for updates…".into(),
     });
     let latest = modrinth::fetch_latest_version(client).await?;
+
+    // authlib-injector: fetch once (341 KB) so third-party online auth
+    // (Ely.by / LittleSkin session servers) works at game launch.
+    ensure_authlib_injector(client, base_dir, cancel, &mut progress).await?;
 
     let mrpack = latest.primary_mrpack().ok_or_else(|| {
         UpdateError::Integrity("pack version has no primary .mrpack".into())

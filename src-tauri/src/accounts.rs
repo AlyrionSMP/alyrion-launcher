@@ -1,7 +1,7 @@
-//! Account management: Offline, LittleSkin (Yggdrasil) and Ely.by (OAuth2)
-//! providers. Tokens are persisted to `accounts.json` in the launcher data
-//! dir; passwords are never stored (LittleSkin Yggdrasil flow uses the
-//! access token afterwards; the password is only sent once over HTTPS).
+//! Account management: Offline, LittleSkin (Yggdrasil) and Ely.by
+//! (Yggdrasil authserver) providers. Tokens are persisted to `accounts.json`
+//! in the launcher data dir; passwords are never stored — they are only sent
+//! once over HTTPS to the chosen auth server.
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -100,20 +100,6 @@ pub fn make_offline(username: &str) -> Account {
         refresh_token: None,
         client_token: None,
     }
-}
-
-/// Percent-encode for query strings (like `redirect_uri=http%3A%2F%2F…`).
-pub fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }
 
 /// Lightweight v4-ish UUID (good enough as client token / state).
@@ -231,218 +217,135 @@ pub async fn littleskin_refresh(
     })
 }
 
-pub const ELYBY_REDIRECT: &str = "http://127.0.0.1:17423/callback";
-pub const ELYBY_REDIRECT_PORT: u16 = 17423;
+/// Ely.by Yggdrasil authserver root (Mojang-compatible — same as XMCL et al).
+pub const ELYBY_AUTHSERVER: &str = "https://authserver.ely.by";
 
-/// Ely.by OAuth2 code flow:
-///  1. open the authorize page in the system browser with a localhost
-///     redirect URI (registered as `ELYBY_REDIRECT`)
-///  2. a loopback HTTP listener on the fixed port captures the `code`
-///  3. exchange code → access_token at the token endpoint (secret required)
-///  4. fetch the current user to get username/uuid
+/// Direct-credential login against Ely.by's Mojang-compatible authserver
+/// (`POST /auth/authenticate`). No OAuth app, no client id/secret, no
+/// browser — exactly how XMCL and other launchers do it.
 ///
-/// Ely.by does NOT support public clients / PKCE — the `client_secret` is
-/// mandatory for both the code exchange and the refresh grant. The secret is
-/// therefore read from the user's local `settings.json` (`elyby_client_secret`)
-/// and is never compiled into the binary or committed. See README.
-pub async fn elyby_login(
+/// The password is sent once over HTTPS and never stored; only the
+/// accessToken + clientToken are kept. If the account has 2FA enabled the
+/// server answers 401 `ForbiddenOperationException`; the caller should then
+/// pass `password:totp` to retry.
+pub async fn elyby_authenticate(
     client: &reqwest::Client,
-    client_id: &str,
-    client_secret: &str,
+    username: &str,
+    password: &str,
 ) -> Result<Account, AuthError> {
-    if client_id.trim().is_empty() || client_id == "your-elyby-client-id" {
-        return Err(AuthError::Msg(
-            "Ely.by client id is not configured. Put your Ely.by OAuth app \
-             client id under `elyby_client_id` in settings.json (see README)."
-                .into(),
-        ));
-    }
-    if client_secret.trim().is_empty() || client_secret == "your-elyby-client-secret" {
-        return Err(AuthError::Msg(
-            "Ely.by client secret is not configured. Put your Ely.by OAuth app \
-             client secret under `elyby_client_secret` in settings.json — it \
-             never ships in the binary and you should rotate it if it ever leaks."
-                .into(),
-        ));
-    }
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", ELYBY_REDIRECT_PORT))
-        .await
-        .map_err(|e| AuthError::Msg(format!("cannot listen for Ely.by redirect: {e}")))?;
-    let redirect = ELYBY_REDIRECT.to_string();
-    let state = uuid_v4();
-    // Percent-encode the redirect URI (Ely.by expects a query param).
-    let redirect_enc = urlencode(&redirect);
-    let auth_url = format!(
-        "https://account.ely.by/oauth2/v1?client_id={client_id}\
-         &redirect_uri={redirect_enc}&response_type=code\
-         &scope=account_info%20offline_access&state={state}"
-    );
-
-    tauri_plugin_opener::open_url(&auth_url, None::<&str>)
-        .map_err(|e| AuthError::Msg(format!("cannot open browser: {e}")))?;
-
-    // Wait for the browser to bounce back to our loopback listener.
-    let (mut socket, _) =
-        tokio::time::timeout(Duration::from_secs(300), listener.accept())
-            .await
-            .map_err(|_| AuthError::Msg("timed out waiting for Ely.by login".into()))??;
-
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut buf = [0u8; 8192];
-    let n = socket.read(&mut buf).await?;
-    let req = String::from_utf8_lossy(&buf[..n]).to_string();
-
-    // `GET /callback?code=...&state=... HTTP/1.1`
-    let query = req
-        .lines()
-        .next()
-        .and_then(|line| {
-            line.split_whitespace()
-                .nth(1)
-                .and_then(|p| p.split('?').nth(1))
-        })
-        .unwrap_or_default();
-    let mut params = std::collections::HashMap::new();
-    for kv in query.split('&') {
-        if let Some((k, v)) = kv.split_once('=') {
-            params.insert(k.to_string(), v.to_string());
-        }
-    }
-    // CSRF defense: the `state` echoed back must match the one we issued.
-    if params.get("state").map(String::as_str) != Some(state.as_str()) {
-        return Err(AuthError::Msg(
-            "Ely.by login rejected: state mismatch (possible CSRF). Try again.".into(),
-        ));
-    }
-    let code = params
-        .get("code")
-        .cloned()
-        .ok_or_else(|| AuthError::Msg("Ely.by callback did not contain a code".into()))?;
-
-    // Respond to the browser so the user can close the tab.
-    let _ = socket
-        .write_all(
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n\
-              Content-Length: 47\r\nConnection: close\r\n\r\n\
-              You can close this tab and return to the launcher.",
-        )
-        .await;
-
-    // Exchange code for token.
-    let params = [
-        ("grant_type", "authorization_code"),
-        ("client_id", client_id),
-        ("client_secret", client_secret),
-        ("redirect_uri", redirect.as_str()),
-        ("code", code.as_str()),
-    ];
+    let client_token = uuid_v4();
+    let body = serde_json::json!({
+        "username": username,
+        "password": password,
+        "clientToken": client_token,
+        "requestUser": true,
+    });
     let resp = client
-        .post("https://account.ely.by/api/oauth2/v1/token")
-        .form(&params)
+        .post(format!("{ELYBY_AUTHSERVER}/auth/authenticate"))
+        .json(&body)
         .send()
         .await?;
     let status = resp.status();
     let text = resp.text().await?;
     if !status.is_success() {
+        // Surface the server's human-readable errorMessage when present.
+        let msg = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| {
+                v.get("errorMessage")
+                    .and_then(|x| x.as_str())
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| text.clone());
         return Err(AuthError::Msg(format!(
-            "Ely.by token exchange failed ({status}): {text}"
+            "Ely.by login failed ({status}): {msg}"
         )));
     }
     let v: serde_json::Value = serde_json::from_str(&text)?;
     let access = v
-        .get("access_token")
+        .get("accessToken")
         .and_then(|x| x.as_str())
-        .ok_or_else(|| AuthError::Msg("Ely.by: missing access_token".into()))?
+        .ok_or_else(|| AuthError::Msg("Ely.by: missing accessToken".into()))?
         .to_string();
-    let refresh = v.get("refresh_token").and_then(|x| x.as_str()).map(String::from);
-
-    // Fetch the current user.
-    let resp = client
-        .get("https://account.ely.by/api/account/v1/info")
-        .bearer_auth(&access)
-        .send()
-        .await?;
-    let status = resp.status();
-    let text = resp.text().await?;
-    if !status.is_success() {
-        return Err(AuthError::Msg(format!(
-            "Ely.by user lookup failed ({status}): {text}"
-        )));
-    }
-    let user: serde_json::Value = serde_json::from_str(&text)?;
-    let username = user
-        .get("username")
-        .or_else(|| user.get("name"))
-        .and_then(|x| x.as_str())
-        .unwrap_or("ElyByPlayer")
-        .to_string();
-    let uuid = user
-        .get("uuid")
-        .and_then(|x| x.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| offline_uuid(&username));
-
+    let (name, uid) = match v.get("selectedProfile") {
+        Some(sel) if sel.is_object() => (
+            sel.get("name")
+                .and_then(|x| x.as_str())
+                .unwrap_or(username)
+                .to_string(),
+            sel.get("id")
+                .and_then(|x| x.as_str())
+                .unwrap_or(&offline_uuid(username))
+                .to_string(),
+        ),
+        _ => (username.to_string(), offline_uuid(username)),
+    };
     Ok(Account {
         provider: Provider::ElyBy,
-        username,
-        uuid,
+        username: name,
+        uuid: uid,
         access_token: access,
-        refresh_token: refresh,
-        client_token: None,
+        refresh_token: None,
+        client_token: Some(client_token),
     })
 }
 
-/// Renew an Ely.by token (keeps user signed in across sessions).
-/// Requires `offline_access` scope (requested at login) and the client secret.
+/// Refresh an Ely.by access token via `POST /auth/refresh` (no password
+/// needed, keeps the user signed in across sessions).
 pub async fn elyby_refresh(
     client: &reqwest::Client,
-    client_id: &str,
-    client_secret: &str,
     account: &Account,
 ) -> Result<Account, AuthError> {
-    let rt = account
-        .refresh_token
-        .clone()
-        .ok_or_else(|| AuthError::Msg("no refresh token".into()))?;
-    if client_secret.trim().is_empty() || client_secret == "your-elyby-client-secret" {
-        return Err(AuthError::Msg(
-            "Ely.by client secret is not configured (settings.json \
-             `elyby_client_secret`) — cannot refresh the session.".into(),
-        ));
-    }
-    let params = [
-        ("grant_type", "refresh_token"),
-        ("client_id", client_id),
-        ("client_secret", client_secret),
-        ("scope", "account_info offline_access"),
-        ("refresh_token", rt.as_str()),
-    ];
+    let access = account
+        .access_token
+        .clone();
+    let client_token = account.client_token.clone().unwrap_or_else(uuid_v4);
+    let body = serde_json::json!({
+        "accessToken": access,
+        "clientToken": client_token,
+        "requestUser": true,
+    });
     let resp = client
-        .post("https://account.ely.by/api/oauth2/v1/token")
-        .form(&params)
+        .post(format!("{ELYBY_AUTHSERVER}/auth/refresh"))
+        .json(&body)
         .send()
         .await?;
     let status = resp.status();
     let text = resp.text().await?;
     if !status.is_success() {
+        let msg = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v.get("errorMessage").and_then(|x| x.as_str()).map(String::from))
+            .unwrap_or_else(|| text.clone());
         return Err(AuthError::Msg(format!(
-            "Ely.by refresh failed ({status}): {text}"
+            "Ely.by session expired ({status}): {msg} — please log in again"
         )));
     }
     let v: serde_json::Value = serde_json::from_str(&text)?;
-    let access = v
-        .get("access_token")
+    let new_access = v
+        .get("accessToken")
         .and_then(|x| x.as_str())
         .unwrap_or(&account.access_token)
         .to_string();
-    let refresh = v.get("refresh_token").and_then(|x| x.as_str()).map(String::from);
+    let uid = v
+        .get("selectedProfile")
+        .and_then(|s| s.get("id"))
+        .and_then(|x| x.as_str())
+        .unwrap_or(&account.uuid)
+        .to_string();
+    let name = v
+        .get("selectedProfile")
+        .and_then(|s| s.get("name"))
+        .and_then(|x| x.as_str())
+        .unwrap_or(&account.username)
+        .to_string();
     Ok(Account {
         provider: Provider::ElyBy,
-        username: account.username.clone(),
-        uuid: account.uuid.clone(),
-        access_token: access,
-        refresh_token: refresh.or(account.refresh_token.clone()),
-        client_token: None,
+        username: name,
+        uuid: uid,
+        access_token: new_access,
+        refresh_token: None,
+        client_token: Some(client_token),
     })
 }
 
@@ -458,13 +361,6 @@ pub fn load_settings(base_dir: &std::path::Path) -> Settings {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
-    /// Ely.by OAuth app client id (owner registers at account.ely.by).
-    #[serde(default)]
-    pub elyby_client_id: String,
-    /// Ely.by OAuth app client secret — lives ONLY in settings.json, never
-    /// in the repo or binary. Rotate it if it leaks.
-    #[serde(default)]
-    pub elyby_client_secret: String,
     /// LittleSkin Yggdrasil server base.
     #[serde(default = "default_littleskin_server")]
     pub littleskin_server: String,

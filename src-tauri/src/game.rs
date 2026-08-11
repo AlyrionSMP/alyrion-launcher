@@ -501,6 +501,10 @@ pub struct Session {
     pub uuid: String,
     pub access_token: String,
     pub user_type: String,
+    /// When set, `authlib-injector` is added as a javaagent with this
+    /// Mojang-API-compatible base URL (Ely.by: `https://authserver.ely.by`,
+    /// LittleSkin: their Yggdrasil server). Offline sessions leave it None.
+    pub authserver_url: Option<String>,
 }
 
 /// Everything needed to spawn the game.
@@ -576,6 +580,26 @@ pub fn build_launch_spec(
     jvm_args.push(format!("-Xmx{mem_mb}M"));
     jvm_args.push(format!("-Xms{}M", (mem_mb / 4).max(256)));
     jvm_args.push("-Djava.library.path={natives_dir}".replace("{natives_dir}", &natives_dir));
+
+    // authlib-injector: for online third-party accounts (Ely.by / LittleSkin)
+    // the game must talk to that server's session endpoint, not Mojang's.
+    // The injector jar is fetched by the updater into `authlib-injector.jar`;
+    // `authserver_url` is the Mojang-API-compatible base to point it at.
+    if let Some(server) = &session.authserver_url {
+        let injected = base_dir.join("authlib-injector.jar");
+        if injected.is_file() {
+            jvm_args.push(format!(
+                "-javaagent:{}= {}",
+                injected.to_string_lossy(),
+                server
+            ));
+        } else {
+            // The jar is missing — skip the agent (the game would fall back
+            // to Mojang sessions, i.e. only offline play works). The updater
+            // normally provides it; surface a warning in the log.
+            eprintln!("[alyrion] authlib-injector.jar not found — third-party online auth unavailable");
+        }
+    }
 
     // JVM args from the profiles (rule-filtered, tokens substituted later).
     let collect = |args: &[serde_json::Value]| -> Vec<String> {

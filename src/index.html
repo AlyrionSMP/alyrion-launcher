@@ -115,10 +115,12 @@
             </div>
 
             <div id="pane-elyby" class="pane" hidden>
-              <p class="muted">Opens the Ely.by login page in your browser. After
-              signing in there, this launcher receives the session automatically.</p>
-              <button id="btn-elyby" class="btn btn-small">Sign in with Ely.by</button>
-              <p class="muted tiny">Set elyby_client_id + elyby_client_secret in settings.json — see README. Secret stays local, never in the binary.</p>
+              <label>Ely.by username / email</label>
+              <input id="eb-username" type="text" placeholder="username" />
+              <label>Password</label>
+              <input id="eb-password" type="password" placeholder="••••••••" />
+              <button id="btn-elyby" class="btn btn-small">Sign in</button>
+              <p class="muted tiny">Sent to authserver.ely.by over HTTPS (same as XMCL). No OAuth app needed.</p>
             </div>
 
             <div class="saved-accounts">

@@ -231,10 +231,16 @@ async function boot() {
     }
   });
 
-  // Ely.by login
+  // Ely.by login (direct credentials, Yggdrasil)
   $("btn-elyby").addEventListener("click", async () => {
+    const u = ($("eb-username") as HTMLInputElement).value.trim();
+    const p = ($("eb-password") as HTMLInputElement).value;
+    if (!u || !p) {
+      toast("Enter username and password");
+      return;
+    }
     try {
-      await invoke("login_elyby", {});
+      await invoke("login_elyby", { username: u, password: p });
       modal.hidden = true;
     } catch (e) {
       toast(String(e));
