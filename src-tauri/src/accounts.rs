@@ -238,13 +238,18 @@ pub const ELYBY_REDIRECT_PORT: u16 = 17423;
 ///  1. open the authorize page in the system browser with a localhost
 ///     redirect URI (registered as `ELYBY_REDIRECT`)
 ///  2. a loopback HTTP listener on the fixed port captures the `code`
-///  3. exchange code → access_token at the token endpoint
+///  3. exchange code → access_token at the token endpoint (secret required)
 ///  4. fetch the current user to get username/uuid
 ///
-/// Requires an Ely.by application `client_id`; configured in settings.json
-/// under `elyby_client_id` (see README — the owner must register one app at
-/// https://ely.by/ with redirect URI `http://127.0.0.1:17423/callback`).
-pub async fn elyby_login(client: &reqwest::Client, client_id: &str) -> Result<Account, AuthError> {
+/// Ely.by does NOT support public clients / PKCE — the `client_secret` is
+/// mandatory for both the code exchange and the refresh grant. The secret is
+/// therefore read from the user's local `settings.json` (`elyby_client_secret`)
+/// and is never compiled into the binary or committed. See README.
+pub async fn elyby_login(
+    client: &reqwest::Client,
+    client_id: &str,
+    client_secret: &str,
+) -> Result<Account, AuthError> {
     if client_id.trim().is_empty() || client_id == "your-elyby-client-id" {
         return Err(AuthError::Msg(
             "Ely.by client id is not configured. Put your Ely.by OAuth app \
@@ -252,14 +257,25 @@ pub async fn elyby_login(client: &reqwest::Client, client_id: &str) -> Result<Ac
                 .into(),
         ));
     }
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", ELYBY_REDIRECT_PORT)).await?;
+    if client_secret.trim().is_empty() || client_secret == "your-elyby-client-secret" {
+        return Err(AuthError::Msg(
+            "Ely.by client secret is not configured. Put your Ely.by OAuth app \
+             client secret under `elyby_client_secret` in settings.json — it \
+             never ships in the binary and you should rotate it if it ever leaks."
+                .into(),
+        ));
+    }
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", ELYBY_REDIRECT_PORT))
+        .await
+        .map_err(|e| AuthError::Msg(format!("cannot listen for Ely.by redirect: {e}")))?;
     let redirect = ELYBY_REDIRECT.to_string();
     let state = uuid_v4();
     // Percent-encode the redirect URI (Ely.by expects a query param).
     let redirect_enc = urlencode(&redirect);
     let auth_url = format!(
-        "https://ely.by/oauth2/authorize?response_type=code&client_id={client_id}\
-         &redirect_uri={redirect_enc}&scope=account_info&state={state}"
+        "https://account.ely.by/oauth2/v1?client_id={client_id}\
+         &redirect_uri={redirect_enc}&response_type=code\
+         &scope=account_info%20offline_access&state={state}"
     );
 
     tauri_plugin_opener::open_url(&auth_url, None::<&str>)
@@ -316,11 +332,12 @@ pub async fn elyby_login(client: &reqwest::Client, client_id: &str) -> Result<Ac
     let params = [
         ("grant_type", "authorization_code"),
         ("client_id", client_id),
+        ("client_secret", client_secret),
         ("redirect_uri", redirect.as_str()),
         ("code", code.as_str()),
     ];
     let resp = client
-        .post("https://ely.by/api/oauth2/v1/token")
+        .post("https://account.ely.by/api/oauth2/v1/token")
         .form(&params)
         .send()
         .await?;
@@ -341,7 +358,7 @@ pub async fn elyby_login(client: &reqwest::Client, client_id: &str) -> Result<Ac
 
     // Fetch the current user.
     let resp = client
-        .get("https://ely.by/api/users/current")
+        .get("https://account.ely.by/api/account/v1/info")
         .bearer_auth(&access)
         .send()
         .await?;
@@ -376,22 +393,32 @@ pub async fn elyby_login(client: &reqwest::Client, client_id: &str) -> Result<Ac
 }
 
 /// Renew an Ely.by token (keeps user signed in across sessions).
+/// Requires `offline_access` scope (requested at login) and the client secret.
 pub async fn elyby_refresh(
     client: &reqwest::Client,
     client_id: &str,
+    client_secret: &str,
     account: &Account,
 ) -> Result<Account, AuthError> {
     let rt = account
         .refresh_token
         .clone()
         .ok_or_else(|| AuthError::Msg("no refresh token".into()))?;
+    if client_secret.trim().is_empty() || client_secret == "your-elyby-client-secret" {
+        return Err(AuthError::Msg(
+            "Ely.by client secret is not configured (settings.json \
+             `elyby_client_secret`) — cannot refresh the session.".into(),
+        ));
+    }
     let params = [
         ("grant_type", "refresh_token"),
         ("client_id", client_id),
+        ("client_secret", client_secret),
+        ("scope", "account_info offline_access"),
         ("refresh_token", rt.as_str()),
     ];
     let resp = client
-        .post("https://ely.by/api/oauth2/v1/token")
+        .post("https://account.ely.by/api/oauth2/v1/token")
         .form(&params)
         .send()
         .await?;
@@ -431,9 +458,13 @@ pub fn load_settings(base_dir: &std::path::Path) -> Settings {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
-    /// Ely.by OAuth app client id (owner must register at ely.by/).
+    /// Ely.by OAuth app client id (owner registers at account.ely.by).
     #[serde(default)]
     pub elyby_client_id: String,
+    /// Ely.by OAuth app client secret — lives ONLY in settings.json, never
+    /// in the repo or binary. Rotate it if it leaks.
+    #[serde(default)]
+    pub elyby_client_secret: String,
     /// LittleSkin Yggdrasil server base.
     #[serde(default = "default_littleskin_server")]
     pub littleskin_server: String,

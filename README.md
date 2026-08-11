@@ -55,18 +55,35 @@ The launcher supports three ways to sign in:
   single-player, LAN and any server that doesn't enforce online auth.
 - **LittleSkin** — Yggdrasil login against `littleskin.cn` (the server can be
   overridden). Password is sent once over HTTPS; only tokens are stored.
-- **Ely.by** — full OAuth2 flow in your system browser. **Requires the
-  launcher owner to register an Ely.by application** at
-  https://ely.by/admin/apps (free, a few minutes — this is application setup,
-  not a player signup) with:
+- **Ely.by** — full OAuth2 flow in your system browser. **Requires
+  registering an Ely.by application** at https://account.ely.by/dev/applications/new
+  (free, a couple of minutes — application setup, not a player signup):
+  - **Application type:** Website
   - **Application name:** `Alyrion Launcher` (or anything)
   - **Redirect URI:** `http://127.0.0.1:17423/callback`
-  - **Scopes:** `account_info`
-  Put the resulting **client id** in `settings.json`:
+  - **Scopes used:** `account_info offline_access` (they're requested at
+    login; there is no scope list on the form itself)
+  - After creation you get a **Client ID** and a **Client Secret**.
+  Put **both** in `settings.json`:
 
 ```json
-{ "elyby_client_id": "your-client-id-here" }
+{
+  "elyby_client_id": "your-client-id",
+  "elyby_client_secret": "your-client-secret"
+}
 ```
+
+### About the client secret
+
+Ely.by **requires** the client secret for both the code exchange and the
+refresh grant — it does not support public clients or PKCE. Because anything
+compiled into the binary can be extracted, **the launcher never embeds or
+commits the secret**: it is read at runtime from `settings.json` on the
+user's machine. If a secret is ever leaked or published (e.g. in a chat
+paste), **rotate it immediately** in the Ely.by app settings and put the new
+one in `settings.json`. The blast radius of a leaked Ely.by client secret is
+limited (app impersonation + token quota), it does not grant access to
+anyone's Minecraft account — but rotate it anyway.
 
 The `settings.json` file lives in the launcher data folder next to
 `accounts.json`, and may also override `littleskin_server`:
@@ -74,6 +91,7 @@ The `settings.json` file lives in the launcher data folder next to
 ```json
 {
   "elyby_client_id": "…",
+  "elyby_client_secret": "…",
   "littleskin_server": "https://littleskin.cn/api/yggdrasil"
 }
 ```

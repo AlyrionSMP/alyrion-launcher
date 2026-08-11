@@ -202,7 +202,8 @@ async fn login_elyby(app: tauri::AppHandle) -> Result<(), String> {
     let ctx = app.state::<Ctx>();
     let settings = accounts::load_settings(&ctx.base_dir);
     let client_id = settings.elyby_client_id.clone();
-    let acc = accounts::elyby_login(&ctx.client, &client_id)
+    let client_secret = settings.elyby_client_secret.clone();
+    let acc = accounts::elyby_login(&ctx.client, &client_id, &client_secret)
         .await
         .map_err(|e| e.to_string())?;
     let mut accs = ctx.accounts.lock().unwrap();
@@ -338,9 +339,13 @@ async fn restore_session(app: tauri::AppHandle) {
     };
     // Try refresh (non-fatal on failure; offline accounts stay as-is).
     let refreshed = match acc.provider {
-        accounts::Provider::ElyBy => {
-            accounts::elyby_refresh(&ctx.client, &settings.elyby_client_id, &acc).await
-        }
+        accounts::Provider::ElyBy => accounts::elyby_refresh(
+            &ctx.client,
+            &settings.elyby_client_id,
+            &settings.elyby_client_secret,
+            &acc,
+        )
+        .await,
         accounts::Provider::LittleSkin => {
             accounts::littleskin_refresh(&ctx.client, &settings.littleskin_server, &acc).await
         }
