@@ -10,18 +10,34 @@
   <body>
     <div id="app" class="app">
       <!-- Titlebar -->
-      <header class="titlebar">
-        <div class="titlebar-left">
-          <svg class="gear" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
-            <circle cx="12" cy="12" r="3.2" />
-            <path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.2a1.6 1.6 0 0 0-1-1.5 1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.2a1.6 1.6 0 0 0 1.5-1 1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3h.1a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.2a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8v.1a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.2a1.6 1.6 0 0 0-1.5 1z" />
+      <header class="titlebar" data-tauri-drag-region>
+        <div class="titlebar-left" data-tauri-drag-region>
+          <svg class="mark" width="15" height="15" viewBox="0 0 16 16" fill="none"
+               stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+               stroke-linejoin="round" data-tauri-drag-region>
+            <path d="M2.5 13 8 3.5 13.5 13" />
+            <path d="M5 9.5h6" />
           </svg>
-          <span class="title">ALYRION <em>LAUNCHER</em></span>
+          <span class="wordmark" data-tauri-drag-region>
+            Alyrion <span class="wordmark-sub">Launcher</span>
+          </span>
         </div>
         <div class="titlebar-right">
-          <button id="win-min" class="tbtn" title="Minimize">–</button>
-          <button id="win-max" class="tbtn" title="Maximize">□</button>
-          <button id="win-close" class="tbtn tbtn-close" title="Close">×</button>
+          <button id="win-min" class="tbtn" title="Minimize" aria-label="Minimize">
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.2">
+              <path d="M0 5h10" />
+            </svg>
+          </button>
+          <button id="win-max" class="tbtn" title="Maximize" aria-label="Maximize">
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.2">
+              <rect x="0.6" y="0.6" width="8.8" height="8.8" rx="1.2" />
+            </svg>
+          </button>
+          <button id="win-close" class="tbtn tbtn-close" title="Close" aria-label="Close">
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round">
+              <path d="M1 1l8 8M9 1l-8 8" />
+            </svg>
+          </button>
         </div>
       </header>
 
@@ -30,25 +46,41 @@
         <!-- Left panel: identity -->
         <section class="panel panel-left">
           <div class="pack-header">
-            <div class="pack-icon" id="pack-icon"></div>
+            <div class="pack-icon" id="pack-icon" aria-hidden="true">
+              <svg width="26" height="26" viewBox="0 0 16 16" fill="none"
+                   stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+                   stroke-linejoin="round">
+                <path d="M2.5 13 8 3.5 13.5 13" />
+                <path d="M5 9.5h6" />
+              </svg>
+            </div>
             <div class="pack-names">
-              <h1 class="pack-title">ALYRION <span>VII</span></h1>
-              <p class="pack-sub">The Official Modpack</p>
+              <h1 class="pack-title">Alyrion <span>VII</span></h1>
+              <p class="pack-sub">Official Modpack</p>
             </div>
           </div>
 
-          <div class="version-chip-row">
-            <div class="chip" id="chip-version">—</div>
-            <div class="chip" id="chip-mc">1.21.1</div>
-            <div class="chip" id="chip-loader">NeoForge</div>
+          <div class="chips">
+            <span class="chip" id="chip-version">—</span>
+            <span class="chip">MC 1.21.1</span>
+            <span class="chip">NeoForge</span>
           </div>
 
           <div id="instance-status" class="instance-status">Checking…</div>
 
-          <div class="progress-wrap" id="progress-wrap" hidden>
-            <div class="progress-label" id="progress-label">—</div>
-            <div class="progress-track"><div class="progress-fill" id="progress-fill" style="width:0%"></div></div>
-            <div class="progress-detail" id="progress-detail"></div>
+          <div id="progress-wrap" class="progress-wrap" hidden>
+            <div class="progress-top">
+              <span class="progress-label" id="progress-label">—</span>
+              <span class="progress-detail" id="progress-detail"></span>
+            </div>
+            <div class="progress-track">
+              <div class="progress-fill" id="progress-fill" style="width:0%"></div>
+            </div>
+          </div>
+
+          <div id="error-box" class="error-box" hidden>
+            <div class="error-title">Something went wrong</div>
+            <div id="error-text" class="error-text"></div>
           </div>
 
           <button id="btn-play" class="btn btn-play" disabled>Starting…</button>
@@ -56,9 +88,12 @@
 
           <div class="footer-meta">
             <div class="meta-line"><span class="kv">Java</span><span id="meta-java">—</span></div>
-            <div class="meta-line"><span class="kv">Player</span><span id="meta-player">Offline · AlyrionPlayer</span></div>
-            <div class="meta-line"><span class="kv">Mode</span><span id="meta-mode">Auto-update</span></div>
-            <div class="meta-line"><button id="btn-account" class="link-btn">Accounts…</button></div>
+            <div class="meta-line"><span class="kv">Player</span><span id="meta-player">Not logged in</span></div>
+            <div class="meta-actions">
+              <button id="btn-account" class="link-btn">Accounts</button>
+              <span class="meta-dot">·</span>
+              <button id="btn-settings" class="link-btn">Settings</button>
+            </div>
           </div>
         </section>
 
@@ -68,16 +103,17 @@
             <h2>Changelog</h2>
             <a id="open-modrinth" href="#" class="link-external">Modrinth ↗</a>
           </div>
+          <div class="news-meta" id="news-meta" hidden></div>
           <div class="changelog" id="changelog">
             <p class="muted">Loading release notes…</p>
           </div>
         </section>
       </main>
 
-      <!-- Toast / error -->
+      <!-- Toast -->
       <div id="toast" class="toast" hidden>
         <span id="toast-text"></span>
-        <button id="toast-close" class="toast-close">×</button>
+        <button id="toast-close" class="toast-close" aria-label="Dismiss">×</button>
       </div>
 
       <!-- Accounts modal -->
@@ -85,47 +121,98 @@
         <div class="modal-card">
           <div class="modal-head">
             <h2>Accounts</h2>
-            <button id="modal-close" class="tbtn">×</button>
+            <button id="modal-close" class="tbtn" aria-label="Close">
+              <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round">
+                <path d="M1 1l8 8M9 1l-8 8" />
+              </svg>
+            </button>
           </div>
           <div class="modal-body">
-            <p class="muted" style="margin-bottom:8px">
-              Log in with one of the supported providers. Tokens are stored
+            <p class="modal-hint">
+              Sign in with one of the supported providers. Tokens are stored
               locally; passwords are never saved.
             </p>
-            <div id="provider-tabs" class="tabs">
-              <button class="tab" data-provider="offline">Offline</button>
-              <button class="tab" data-provider="littleskin">LittleSkin</button>
-              <button class="tab" data-provider="elyby">Ely.by</button>
+            <div class="tabs" role="tablist">
+              <button class="tab active" data-provider="offline" role="tab">Offline</button>
+              <button class="tab" data-provider="littleskin" role="tab">LittleSkin</button>
+              <button class="tab" data-provider="elyby" role="tab">Ely.by</button>
             </div>
 
-            <div id="pane-offline" class="pane">
-              <label>Player name</label>
-              <input id="offline-username" type="text" maxlength="16" placeholder="Steve" />
-              <button id="btn-offline" class="btn btn-small">Play offline</button>
-              <p class="muted tiny">Name must be 3–16 characters: letters, digits and underscores.</p>
+            <div id="pane-offline" class="pane" role="tabpanel">
+              <label for="offline-username">Player name</label>
+              <input id="offline-username" type="text" maxlength="16" placeholder="Steve" autocomplete="username" />
+              <p class="tiny">3–16 characters: letters, digits and underscores.</p>
+              <button id="btn-offline" class="btn btn-primary">Play offline</button>
             </div>
 
-            <div id="pane-littleskin" class="pane" hidden>
-              <label>LittleSkin username</label>
-              <input id="ls-username" type="text" placeholder="username" />
-              <label>Password</label>
-              <input id="ls-password" type="password" placeholder="••••••••" />
-              <button id="btn-littleskin" class="btn btn-small">Sign in</button>
-              <p class="muted tiny">Sent to littleskin.cn over HTTPS (Yggdrasil).</p>
+            <div id="pane-littleskin" class="pane" role="tabpanel" hidden>
+              <label for="ls-username">LittleSkin username</label>
+              <input id="ls-username" type="text" placeholder="username" autocomplete="username" />
+              <label for="ls-password">Password</label>
+              <input id="ls-password" type="password" placeholder="••••••••" autocomplete="current-password" />
+              <p class="tiny">Sent to littleskin.cn over HTTPS (Yggdrasil).</p>
+              <button id="btn-littleskin" class="btn btn-primary">Sign in</button>
             </div>
 
-            <div id="pane-elyby" class="pane" hidden>
-              <label>Ely.by username / email</label>
-              <input id="eb-username" type="text" placeholder="username" />
-              <label>Password</label>
-              <input id="eb-password" type="password" placeholder="••••••••" />
-              <button id="btn-elyby" class="btn btn-small">Sign in</button>
-              <p class="muted tiny">Sent to authserver.ely.by over HTTPS (same as XMCL). No OAuth app needed.</p>
+            <div id="pane-elyby" class="pane" role="tabpanel" hidden>
+              <label for="eb-username">Ely.by username / email</label>
+              <input id="eb-username" type="text" placeholder="username" autocomplete="username" />
+              <label for="eb-password">Password</label>
+              <input id="eb-password" type="password" placeholder="••••••••" autocomplete="current-password" />
+              <p class="tiny">Sent to authserver.ely.by over HTTPS. No OAuth app needed.</p>
+              <button id="btn-elyby" class="btn btn-primary">Sign in</button>
             </div>
 
-            <div class="saved-accounts">
-              <div class="kv" style="margin-bottom:6px">Saved accounts</div>
+            <div class="saved-accounts" id="saved-accounts-section" hidden>
+              <div class="saved-head">
+                <span class="kv">Saved accounts</span>
+                <button id="btn-signout" class="link-btn danger" hidden>Sign out</button>
+              </div>
               <div id="saved-accounts-list" class="saved-list"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Settings modal -->
+      <div id="settings-modal" class="modal" hidden>
+        <div class="modal-card">
+          <div class="modal-head">
+            <h2>Settings</h2>
+            <button id="settings-close" class="tbtn" aria-label="Close">
+              <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round">
+                <path d="M1 1l8 8M9 1l-8 8" />
+              </svg>
+            </button>
+          </div>
+          <div class="modal-body">
+            <p class="modal-hint">
+              Configure memory allocation and custom JVM arguments for game launch.
+            </p>
+
+            <div class="pane">
+              <label for="ram-slider">Allocated Memory (RAM)</label>
+              <div class="range-row">
+                <input id="ram-slider" type="range" min="2048" max="32768" step="512" value="4096" />
+                <span id="ram-val" class="range-val">4096 MB (4.0 GB)</span>
+              </div>
+              <p class="tiny">Recommended: 4096 MB – 8192 MB for modern modpacks.</p>
+            </div>
+
+            <div class="pane">
+              <label for="jvm-args">Custom JVM Arguments</label>
+              <textarea id="jvm-args" placeholder="-XX:+UseG1GC -XX:+ParallelRefProcEnabled" rows="3"></textarea>
+              <p class="tiny">Optional extra flags passed to Java. Core heap flags (-Xmx), module paths, and classpath are managed automatically.</p>
+            </div>
+
+            <div class="pane">
+              <label for="settings-littleskin">LittleSkin Auth Server</label>
+              <input id="settings-littleskin" type="text" placeholder="https://littleskin.cn/api/yggdrasil" />
+              <p class="tiny">Yggdrasil API base URL for LittleSkin authentication.</p>
+            </div>
+
+            <div class="settings-actions">
+              <button id="btn-save-settings" class="btn btn-primary">Save Settings</button>
             </div>
           </div>
         </div>

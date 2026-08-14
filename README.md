@@ -29,13 +29,22 @@ exists it automatically updates before you can press Play.
 - **Blocked play during updates** — enforced in both the Rust state machine
   (Play command refused unless `Ready`) and the UI (button disabled).
 - **Single instance lock** — only one launcher/game can run at a time.
-- **Steampunk UI** — brass-and-ochre theme for the Alyrion world.
+- **Minimal UI** — clean, flat dark interface with a single accent; no
+  ornament, just the essentials.
 
 ## Development
 
-Prerequisites: Node 18+, Rust stable, and Tauri v2's system deps
-(`libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `libsoup-3.0-dev`, `librsvg2-dev`,
-`pkg-config` — see [tauri.app](https://tauri.app/start/prerequisites/)).
+Prerequisites: Node 18+, Rust stable, and Tauri v2's system deps.
+
+- **Linux**: `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `libsoup-3.0-dev`,
+  `librsvg2-dev`, `pkg-config` — see
+  [tauri.app](https://tauri.app/start/prerequisites/).
+- **macOS**: Xcode Command Line Tools (`xcode-select --install`). No extra
+  libraries are required.
+- To actually launch the game you also need a **Java 21+** runtime on the
+  machine (the launcher looks for one automatically; on macOS it checks
+  `/usr/libexec/java_home`, `/Library/Java/JavaVirtualMachines` and Homebrew —
+  e.g. install Temurin 21).
 
 ```bash
 npm install
@@ -45,7 +54,7 @@ npm run tauri build    # release bundle
 
 The app bundles into installers via Tauri (`npm run tauri build`). The
 Windows build produces an MSI; Linux produces `.deb` and `.AppImage`;
-macOS produces `.dmg`.
+macOS produces a `.dmg` (plus an `.app`).
 
 ## Accounts
 
