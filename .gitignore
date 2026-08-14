@@ -15,3 +15,5 @@ Thumbs.db
 # Bootstrap scratch (never committed)
 .bootstrap/
 .reasonix/
+*.log
+src-tauri/*.log

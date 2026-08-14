@@ -41,10 +41,6 @@ pub enum UpdateError {
     Canceled,
 }
 
-/// Progress callback used to drive UI updates.
-pub type ProgressFn<F> = F;
-
-
 #[derive(Debug, Clone)]
 pub struct Progress {
     pub stage: UpdateStage,
@@ -166,10 +162,21 @@ pub async fn download_verified(
         return Err(UpdateError::Remote(format!("{url} -> {status}")));
     }
 
-    let mut out = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&part_path)?;
+    let is_partial = status == reqwest::StatusCode::PARTIAL_CONTENT;
+    let existing_len = if is_partial { existing_len } else { 0 };
+
+    let mut out = if is_partial {
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&part_path)?
+    } else {
+        fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&part_path)?
+    };
 
     let total = resp.content_length().map(|l| l + existing_len).unwrap_or(existing_len);
     progress(0, total);
@@ -211,6 +218,21 @@ pub async fn download_verified(
     Ok(())
 }
 
+pub fn format_bytes(bytes: u64) -> String {
+    const ONE_GB: u64 = 1024 * 1024 * 1024;
+    if bytes >= ONE_GB {
+        let gb = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        format!("{gb:.2} GB")
+    } else {
+        let mb = bytes as f64 / (1024.0 * 1024.0);
+        if mb >= 10.0 {
+            format!("{mb:.1} MB")
+        } else {
+            format!("{mb:.2} MB")
+        }
+    }
+}
+
 /// Download the pack .mrpack into the download cache.
 pub async fn fetch_mrpack(
     client: &reqwest::Client,
@@ -230,7 +252,7 @@ pub async fn fetch_mrpack(
             progress(Progress {
                 stage: UpdateStage::Fetching,
                 fraction: done as f32 / total as f32,
-                detail: format!("{done} / {total} bytes"),
+                detail: format!("{} / {}", format_bytes(done), format_bytes(total)),
             });
         }
         let _ = (done, total);
@@ -304,6 +326,9 @@ pub async fn install_mrpack(
         if cancel.load(Ordering::Relaxed) {
             return Err(UpdateError::Canceled);
         }
+        if !pf.needed_for_client() {
+            continue;
+        }
         let Some(url) = pf.downloads.first_url() else {
             continue;
         };
@@ -323,8 +348,8 @@ pub async fn install_mrpack(
                     stage: UpdateStage::Downloading,
                     fraction: (idx as f32 + done as f32 / total_bytes as f32) / total as f32,
                     detail: format!(
-                        "[{}/{}] {} ({} / {} bytes)",
-                        idx + 1, total, pf_path, done, total_bytes
+                        "[{}/{}] {} ({} / {})",
+                        idx + 1, total, pf_path, format_bytes(done), format_bytes(total_bytes)
                     ),
                 });
             }
@@ -428,12 +453,130 @@ pub async fn ensure_authlib_injector(
             progress(Progress {
                 stage: UpdateStage::Fetching,
                 fraction: done as f32 / total as f32,
-                detail: format!("authlib-injector.jar ({done}/{total} bytes)"),
+                detail: format!("authlib-injector.jar ({} / {})", format_bytes(done), format_bytes(total)),
             });
         }
         let _ = (done, total);
     };
-    download_verified(client, url, &dest, None, Some(500_000), cancel, &mut prog).await
+    download_verified(client, url, &dest, None, None, cancel, &mut prog).await
+}
+
+pub async fn ensure_neoforge_installed(
+    client: &reqwest::Client,
+    base_dir: &Path,
+    staging_dir: &Path,
+    java: &crate::java::JavaInfo,
+    neoforge_ver: &str,
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(Progress),
+) -> Result<(), UpdateError> {
+    let profile = format!("neoforge-{neoforge_ver}");
+    let staging_profile_json = staging_dir
+        .join("versions")
+        .join(&profile)
+        .join(format!("{profile}.json"));
+
+    if staging_profile_json.is_file() {
+        return Ok(());
+    }
+
+    let live_dir = base_dir.join("instance");
+    let live_profile_json = live_dir
+        .join("versions")
+        .join(&profile)
+        .join(format!("{profile}.json"));
+
+    if live_profile_json.is_file() {
+        for sub in ["versions", "libraries", "assets"] {
+            let src = live_dir.join(sub);
+            let dst = staging_dir.join(sub);
+            if src.is_dir() {
+                let _ = copy_dir_recursive(&src, &dst);
+            }
+        }
+        if staging_profile_json.is_file() {
+            return Ok(());
+        }
+    }
+
+    progress(Progress {
+        stage: UpdateStage::Fetching,
+        fraction: 0.0,
+        detail: format!("Preparing NeoForge {neoforge_ver} installer…"),
+    });
+
+    let installer_name = format!("neoforge-{neoforge_ver}-installer.jar");
+    let installer_url = format!(
+        "https://maven.neoforged.net/releases/net/neoforged/neoforge/{neoforge_ver}/{installer_name}"
+    );
+    let cache_dir = base_dir.join(".alyrion-cache");
+    fs::create_dir_all(&cache_dir)?;
+    let installer_path = cache_dir.join(&installer_name);
+
+    let mut prog = |done: u64, total: u64| {
+        if total > 0 {
+            progress(Progress {
+                stage: UpdateStage::Fetching,
+                fraction: done as f32 / total as f32,
+                detail: format!(
+                    "NeoForge installer ({} / {})",
+                    format_bytes(done),
+                    format_bytes(total)
+                ),
+            });
+        }
+        let _ = (done, total);
+    };
+
+    download_verified(
+        client,
+        &installer_url,
+        &installer_path,
+        None,
+        None,
+        cancel,
+        &mut prog,
+    )
+    .await?;
+
+    if cancel.load(Ordering::Relaxed) {
+        return Err(UpdateError::Canceled);
+    }
+
+    progress(Progress {
+        stage: UpdateStage::Extracting,
+        fraction: 0.5,
+        detail: format!("Installing NeoForge {neoforge_ver} runtime…"),
+    });
+
+    let profiles_json = staging_dir.join("launcher_profiles.json");
+    if !profiles_json.is_file() {
+        fs::write(&profiles_json, b"{\n  \"profiles\": {}\n}\n")?;
+    }
+    fs::create_dir_all(staging_dir.join("versions"))?;
+    fs::create_dir_all(staging_dir.join("libraries"))?;
+
+    let output = std::process::Command::new(&java.path)
+        .current_dir(staging_dir)
+        .arg("-jar")
+        .arg(&installer_path)
+        .arg("--installClient")
+        .arg(staging_dir)
+        .output()
+        .map_err(UpdateError::Io)?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(UpdateError::Integrity(format!(
+            "NeoForge installer failed (exit code {:?}):\n{}\n{}",
+            output.status.code(),
+            stderr.trim(),
+            stdout.trim()
+        )));
+    }
+
+    Ok(())
 }
 
 /// The core update routine. Uses a sidecar staging dir and atomically swaps
@@ -457,6 +600,30 @@ pub async fn update_pack(
     // authlib-injector: fetch once (341 KB) so third-party online auth
     // (Ely.by / LittleSkin session servers) works at game launch.
     ensure_authlib_injector(client, base_dir, cancel, &mut progress).await?;
+
+    // Java 21+: ensure a runtime is present (downloads Temurin 21 if not found on system)
+    let java_info = crate::java::ensure_java(client, base_dir, cancel, &mut progress).await?;
+
+    // Early check: if the instance is already installed with this exact version and NeoForge profile is intact, return immediately.
+    let live = base_dir.join("instance");
+    let previous_version = read_installed_version(&live);
+    let layout = crate::game::InstanceLayout::new(base_dir);
+    let neoforge_installed = crate::game::find_installed_neoforge_profile(&layout).is_some();
+
+    if previous_version.as_deref() == Some(latest.id.as_str())
+        && neoforge_installed
+        && live.join("mods").is_dir()
+    {
+        progress(Progress {
+            stage: UpdateStage::Checking,
+            fraction: 1.0,
+            detail: format!("Pack is up to date ({})", latest.version_number),
+        });
+        return Ok(UpdateOutcome::UpToDate {
+            version: latest.version_number,
+            version_id: latest.id,
+        });
+    }
 
     let mrpack = latest.primary_mrpack().ok_or_else(|| {
         UpdateError::Integrity("pack version has no primary .mrpack".into())
@@ -509,13 +676,65 @@ pub async fn update_pack(
         fraction: 0.0,
         detail: "Extracting and verifying files…".into(),
     });
-    let _index = install_mrpack(client, &mrpack_path, &staging, cancel, &mut progress).await?;
+    let index = install_mrpack(client, &mrpack_path, &staging, cancel, &mut progress).await?;
 
-    // Carry over user data from the previous install (if any).
+    let neoforge_ver = index
+        .dependencies
+        .neoforge
+        .as_deref()
+        .unwrap_or(crate::game::NEOFORGE_VERSION);
+    ensure_neoforge_installed(
+        client,
+        base_dir,
+        &staging,
+        &java_info,
+        neoforge_ver,
+        cancel,
+        &mut progress,
+    )
+    .await?;
+
+    // Sync assets & extract natives into staging
+    let layout = crate::game::InstanceLayout {
+        natives: staging
+            .join("versions")
+            .join(crate::game::MC_VERSION)
+            .join(format!("{}-natives", crate::game::MC_VERSION)),
+        versions: staging.join("versions"),
+        libraries: staging.join("libraries"),
+        assets: staging.join("assets"),
+        indexes: staging.join("assets").join("indexes"),
+        objects: staging.join("assets").join("objects"),
+        logs: staging.join("logs"),
+        root: staging.clone(),
+    };
+
+    if let Ok(vanilla) = crate::game::read_version_json(&layout, crate::game::MC_VERSION) {
+        if let Some(asset_index) = &vanilla.asset_index {
+            let _ = crate::game::sync_assets(client, &layout, asset_index, cancel, |_, _| {}).await;
+        }
+        let profile = crate::game::find_installed_neoforge_profile(&layout)
+            .unwrap_or_else(|| format!("neoforge-{neoforge_ver}"));
+        if let Ok(neoforge) = crate::game::read_version_json(&layout, &profile) {
+            let merged = crate::game::merged_libraries(&vanilla, &neoforge);
+            let _ = crate::game::sync_libraries(client, &layout, &merged, cancel, |_, _| {}).await;
+            let _ = crate::game::extract_natives(&layout, &merged);
+        }
+    }
+
+    // Carry over user data and runtime caches from the previous install.
     let live = base_dir.join("instance");
     let mut preserved: Vec<(String, PathBuf)> = Vec::new();
     if live.exists() {
-        for sub in ["worlds", "screenshots", "resourcepacks"] {
+        for sub in [
+            "worlds",
+            "screenshots",
+            "resourcepacks",
+            "versions",
+            "libraries",
+            "assets",
+            "launcher_profiles.json",
+        ] {
             let p = live.join(sub);
             if p.exists() {
                 preserved.push((sub.to_string(), p));
@@ -540,8 +759,15 @@ pub async fn update_pack(
     }
     for (sub, p) in preserved {
         let dst = live.join(sub);
-        fs::create_dir_all(&dst)?;
-        copy_dir_recursive(&p, &dst)?;
+        if p.is_dir() {
+            let _ = fs::create_dir_all(&dst);
+            let _ = copy_dir_recursive(&p, &dst);
+        } else if p.is_file() {
+            if let Some(parent) = dst.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::copy(&p, &dst);
+        }
     }
     let _ = fs::remove_dir_all(&backup);
     write_installed_version(&live, &latest)?;
@@ -607,5 +833,15 @@ mod safe_join_tests {
         assert!(safe_join(root, "mods/a\0b.jar").is_err());
         assert!(safe_join(root, "mods/ok.jar").is_ok());
         assert!(safe_join(root, "config/x.json").is_ok());
+    }
+
+    #[test]
+    fn test_format_bytes() {
+        assert_eq!(format_bytes(0), "0.00 MB");
+        assert_eq!(format_bytes(349_681), "0.33 MB");
+        assert_eq!(format_bytes(15_728_640), "15.0 MB");
+        assert_eq!(format_bytes(524_288_000), "500.0 MB");
+        assert_eq!(format_bytes(1_073_741_824), "1.00 GB");
+        assert_eq!(format_bytes(2_684_354_560), "2.50 GB");
     }
 }

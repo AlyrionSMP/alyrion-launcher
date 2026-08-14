@@ -40,11 +40,7 @@ pub enum GameError {
     Assets(String),
 }
 
-#[derive(Debug, Clone)]
-pub struct JavaInfo {
-    pub path: PathBuf,
-    pub major: u16,
-}
+pub use crate::java::{find_java, parse_java_major, JavaInfo};
 
 /// A single entry of a version.json `libraries` array.
 #[derive(Debug, Clone, Deserialize)]
@@ -84,6 +80,8 @@ pub struct Rule {
     pub action: String,
     #[serde(default)]
     pub os: Option<OsMatch>,
+    #[serde(default)]
+    pub features: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -94,31 +92,38 @@ pub struct OsMatch {
     pub arch: Option<String>,
 }
 
+fn evaluate_rules(rules: &[Rule]) -> bool {
+    if rules.is_empty() {
+        return true;
+    }
+    let os = current_os_name();
+    let arch = current_os_arch();
+    // If there is any 'allow' rule without custom features, default is false (opt-in).
+    // If all rules are 'disallow', default is true (opt-out).
+    let mut decision = !rules.iter().any(|r| r.action == "allow" && r.features.is_none());
+    for r in rules {
+        if r.features.is_some() {
+            continue;
+        }
+        let matched = match &r.os {
+            Some(osm) => {
+                let os_ok = osm.name.as_deref().map(|n| n == os).unwrap_or(true);
+                let arch_ok = osm.arch.as_deref().map(|a| a == arch).unwrap_or(true);
+                os_ok && arch_ok
+            }
+            None => true,
+        };
+        if matched {
+            decision = r.action == "allow";
+        }
+    }
+    decision
+}
+
 impl VerLibrary {
     /// Whether this library applies to the current OS.
     pub fn applies_to_current_os(&self) -> bool {
-        if self.rules.is_empty() {
-            return true;
-        }
-        let os = current_os_name();
-        let arch = current_os_arch();
-        // Minecraft rule semantics: the entry applies unless the *last*
-        // matching rule disallows it. An empty rule list = applies.
-        let mut decision = true;
-        for r in &self.rules {
-            let matched = match &r.os {
-                Some(osm) => {
-                    let os_ok = osm.name.as_deref().map(|n| n == os).unwrap_or(true);
-                    let arch_ok = osm.arch.as_deref().map(|a| a == arch).unwrap_or(true);
-                    os_ok && arch_ok
-                }
-                None => true,
-            };
-            if matched {
-                decision = r.action == "allow";
-            }
-        }
-        decision
+        evaluate_rules(&self.rules)
     }
 
     /// Artifact download spec for the current OS (handles natives classifier).
@@ -249,87 +254,6 @@ impl InstanceLayout {
     }
 }
 
-/// Locate java: bundled runtime in launcher dir, then system PATH.
-pub fn find_java(base_dir: &Path) -> Result<JavaInfo, GameError> {
-    for cand in [
-        base_dir.join("runtime").join("bin").join("java"),
-        base_dir.join("runtime").join("java").join("bin").join("java"),
-    ] {
-        if cand.is_file() {
-            if let Some(info) = probe_java(&cand) {
-                return Ok(info);
-            }
-        }
-    }
-    if let Some(p) = which("java") {
-        if let Some(info) = probe_java(&p) {
-            return Ok(info);
-        }
-    }
-    // Common install locations (flatpak / snap java).
-    for p in [
-        "/usr/lib/jvm/java-21-openjdk-amd64/bin/java",
-        "/usr/lib/jvm/temurin-21-jdk-amd64/bin/java",
-        "/usr/lib/jvm/java-21-temurin/bin/java",
-    ] {
-        let p = Path::new(p);
-        if p.is_file() {
-            if let Some(info) = probe_java(p) {
-                return Ok(info);
-            }
-        }
-    }
-    Err(GameError::JavaNotFound(
-        "no Java 21+ runtime found — install Java 21 (e.g. Temurin 21) and restart the launcher".into(),
-    ))
-}
-
-fn probe_java(path: &Path) -> Option<JavaInfo> {
-    let out = Command::new(path).arg("-version").output().ok()?;
-    let text = String::from_utf8_lossy(&out.stderr);
-    let major = parse_java_major(&text);
-    if major >= 21 {
-        Some(JavaInfo {
-            path: path.to_path_buf(),
-            major,
-        })
-    } else {
-        None
-    }
-}
-
-fn parse_java_major(stderr: &str) -> u16 {
-    for line in stderr.lines() {
-        let line = line.trim();
-        // Java prints: `openjdk version "21.0.12" 2026-07-21` (or `java
-        // version "1.8.0_401"`). Extract anything between quotes.
-        let Some(start) = line.find('"') else { continue };
-        let rest = &line[start + 1..];
-        let ver = rest.split('"').next().unwrap_or("");
-        let parts: Vec<&str> = ver.split('.').collect();
-        // "21.0.1" → 21 ; "21" → 21 ; "1.8" → 8
-        if parts[0] == "1" && parts.len() > 1 {
-            if let Ok(v) = parts[1].parse::<u16>() {
-                return v;
-            }
-        } else if let Ok(v) = parts[0].parse::<u16>() {
-            return v;
-        }
-    }
-    0
-}
-
-fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let cand = dir.join(name);
-        if cand.is_file() {
-            return Some(cand);
-        }
-    }
-    None
-}
-
 /// Read a version profile json from the installed instance.
 pub fn read_version_json(layout: &InstanceLayout, profile: &str) -> Result<McVersionJson, GameError> {
     let p = layout.versions.join(profile).join(format!("{profile}.json"));
@@ -386,7 +310,7 @@ pub async fn sync_assets(
     layout: &InstanceLayout,
     index_json: &AssetIndex,
     cancel: &std::sync::atomic::AtomicBool,
-    progress: &mut dyn FnMut(f32, &str),
+    mut progress: impl FnMut(f32, &str) + Send,
 ) -> Result<(), GameError> {
     fs::create_dir_all(&layout.indexes)?;
     fs::create_dir_all(&layout.objects)?;
@@ -457,6 +381,82 @@ pub async fn sync_assets(
     Ok(())
 }
 
+/// Sync all missing library jars for the current OS. Resumable, verified by sha1 when present.
+pub async fn sync_libraries(
+    client: &reqwest::Client,
+    layout: &InstanceLayout,
+    libs: &[(VerLibrary, Option<VerArtifact>, bool)],
+    cancel: &std::sync::atomic::AtomicBool,
+    mut progress: impl FnMut(f32, &str) + Send,
+) -> Result<(), GameError> {
+    fs::create_dir_all(&layout.libraries)?;
+    let total = libs.len() as f32;
+    for (i, (lib, art, _is_native)) in libs.iter().enumerate() {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        let (dest, url, sha1, size) = if let Some(art) = art {
+            let dest = library_local_path(layout, lib, art);
+            let url = art.url.clone().unwrap_or_else(|| {
+                if let Some(p) = &art.path {
+                    format!("https://libraries.minecraft.net/{p}")
+                } else if let Ok(a2) = Artifact::parse(&lib.name) {
+                    format!("https://libraries.minecraft.net/{}", a2.directory())
+                } else {
+                    String::new()
+                }
+            });
+            (dest, url, art.sha1.clone(), art.size)
+        } else if let Ok(a2) = Artifact::parse(&lib.name) {
+            let dest = layout.libraries.join(a2.directory());
+            let url = format!("https://libraries.minecraft.net/{}", a2.directory());
+            (dest, url, None, None)
+        } else {
+            continue;
+        };
+
+        if url.is_empty() || dest.is_file() {
+            continue;
+        }
+
+        if let Some(parent) = dest.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+
+        progress(i as f32 / total, &format!("Library: {}", lib.name));
+
+        let res = crate::update::download_verified(
+            client,
+            &url,
+            &dest,
+            sha1.as_deref(),
+            size,
+            cancel,
+            &mut |_, _| {},
+        )
+        .await;
+
+        if res.is_err() {
+            if let Ok(a2) = Artifact::parse(&lib.name) {
+                let fallback = format!("https://libraries.minecraft.net/{}", a2.directory());
+                if fallback != url {
+                    let _ = crate::update::download_verified(
+                        client,
+                        &fallback,
+                        &dest,
+                        sha1.as_deref(),
+                        size,
+                        cancel,
+                        &mut |_, _| {},
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Extract natives jars (lwjgl etc.) into the natives dir.
 pub fn extract_natives(layout: &InstanceLayout, libs: &[(VerLibrary, Option<VerArtifact>, bool)]) -> Result<(), GameError> {
     let natives_dir = &layout.natives;
@@ -524,6 +524,54 @@ fn substitute(text: &str, vars: &[(&str, &str)]) -> String {
     out
 }
 
+fn evaluate_arguments(args: &[serde_json::Value]) -> Vec<String> {
+    let mut out = Vec::new();
+    for item in args {
+        if let Some(s) = item.as_str() {
+            out.push(s.to_string());
+        } else if let Some(obj) = item.as_object() {
+            let applies = if let Some(rules_val) = obj.get("rules") {
+                if let Ok(rules) = serde_json::from_value::<Vec<Rule>>(rules_val.clone()) {
+                    evaluate_rules(&rules)
+                } else {
+                    true
+                }
+            } else {
+                true
+            };
+            if applies {
+                if let Some(val) = obj.get("value") {
+                    if let Some(s) = val.as_str() {
+                        out.push(s.to_string());
+                    } else if let Some(arr) = val.as_array() {
+                        for v in arr {
+                            if let Some(s) = v.as_str() {
+                                out.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+pub fn find_installed_neoforge_profile(layout: &InstanceLayout) -> Option<String> {
+    if layout.versions.join(NEOFORGE_PROFILE).join(format!("{NEOFORGE_PROFILE}.json")).is_file() {
+        return Some(NEOFORGE_PROFILE.to_string());
+    }
+    if let Ok(entries) = fs::read_dir(&layout.versions) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("neoforge") && entry.path().join(format!("{name}.json")).is_file() {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
 /// Build the complete, ready-to-spawn launch command.
 ///
 /// Steps:
@@ -537,13 +585,12 @@ pub fn build_launch_spec(
     java: &JavaInfo,
     session: &Session,
     mem_mb: u32,
+    custom_jvm_args: &str,
 ) -> Result<LaunchSpec, GameError> {
     let layout = InstanceLayout::new(base_dir);
-    if !layout.versions.join(NEOFORGE_PROFILE).join(format!("{NEOFORGE_PROFILE}.json")).is_file() {
-        return Err(GameError::NotInstalled);
-    }
+    let profile = find_installed_neoforge_profile(&layout).ok_or(GameError::NotInstalled)?;
     let vanilla = read_version_json(&layout, MC_VERSION)?;
-    let neoforge = read_version_json(&layout, NEOFORGE_PROFILE)?;
+    let neoforge = read_version_json(&layout, &profile)?;
 
     let merged = merged_libraries(&vanilla, &neoforge);
 
@@ -579,7 +626,7 @@ pub fn build_launch_spec(
     // Memory + common flags.
     jvm_args.push(format!("-Xmx{mem_mb}M"));
     jvm_args.push(format!("-Xms{}M", (mem_mb / 4).max(256)));
-    jvm_args.push("-Djava.library.path={natives_dir}".replace("{natives_dir}", &natives_dir));
+    jvm_args.push(format!("-Djava.library.path={natives_dir}"));
 
     // authlib-injector: for online third-party accounts (Ely.by / LittleSkin)
     // the game must talk to that server's session endpoint, not Mojang's.
@@ -588,8 +635,11 @@ pub fn build_launch_spec(
     if let Some(server) = &session.authserver_url {
         let injected = base_dir.join("authlib-injector.jar");
         if injected.is_file() {
+            // One argv element; the JVM splits `-javaagent:<path>=<opts>` at
+            // the first `=`, so paths with spaces (macOS Application Support)
+            // survive as long as the whole flag stays a single argument.
             jvm_args.push(format!(
-                "-javaagent:{}= {}",
+                "-javaagent:{}={}",
                 injected.to_string_lossy(),
                 server
             ));
@@ -602,20 +652,16 @@ pub fn build_launch_spec(
     }
 
     // JVM args from the profiles (rule-filtered, tokens substituted later).
-    let collect = |args: &[serde_json::Value]| -> Vec<String> {
-        args.iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect()
-    };
-    let mut profile_jvm = collect(&vanilla.arguments.as_ref().map(|a| a.jvm.clone()).unwrap_or_default());
-    profile_jvm.extend(collect(&neoforge.arguments.as_ref().map(|a| a.jvm.clone()).unwrap_or_default()));
+    let mut profile_jvm = evaluate_arguments(&vanilla.arguments.as_ref().map(|a| a.jvm.clone()).unwrap_or_default());
+    profile_jvm.extend(evaluate_arguments(&neoforge.arguments.as_ref().map(|a| a.jvm.clone()).unwrap_or_default()));
 
-    let mut game_args: Vec<String> = collect(&vanilla.arguments.as_ref().map(|a| a.game.clone()).unwrap_or_default());
-    game_args.extend(collect(&neoforge.arguments.as_ref().map(|a| a.game.clone()).unwrap_or_default()));
+    let mut game_args: Vec<String> = evaluate_arguments(&vanilla.arguments.as_ref().map(|a| a.game.clone()).unwrap_or_default());
+    game_args.extend(evaluate_arguments(&neoforge.arguments.as_ref().map(|a| a.game.clone()).unwrap_or_default()));
 
     // Classpath token.
     let classpath_joined = cp.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>().join(sep);
     let natives_token = natives_dir.clone();
+    let library_dir = layout.libraries.to_string_lossy().to_string();
 
     let vars: Vec<(&str, &str)> = vec![
         ("auth_player_name", &session.username),
@@ -625,7 +671,7 @@ pub fn build_launch_spec(
         ("auth_xuid", "0"),
         ("clientid", "0"),
         ("user_type", &session.user_type),
-        ("version_name", NEOFORGE_PROFILE),
+        ("version_name", &profile),
         ("version_type", "release"),
         ("launcher_name", "Alyrion Launcher"),
         ("launcher_version", env!("CARGO_PKG_VERSION")),
@@ -634,18 +680,47 @@ pub fn build_launch_spec(
         ("assets_root", &assets_dir),
         ("assets_index_name", &asset_index_name),
         ("natives_directory", &natives_token),
+        ("library_directory", &library_dir),
         ("classpath", &classpath_joined),
         ("classpath_separator", sep),
         ("resolution_width", "1280"),
         ("resolution_height", "720"),
     ];
 
-    // Substitute tokens in jvm args.
+    // Substitute tokens in profile jvm args, then prepend our own flags.
+    // Every flag stays its own argv element — joining them into one string
+    // breaks the JVM (it parses a single argv element as one option; verified:
+    // `java "-Xmx64M -Xms32M -version"` → "Invalid maximum heap size") and
+    // would mangle paths containing spaces (e.g. `~/Library/Application
+    // Support/...` on macOS).
     let mut final_jvm: Vec<String> = profile_jvm
         .iter()
         .map(|a| substitute(a, &vars))
         .collect();
-    final_jvm.insert(0, jvm_args.join(" ").to_string());
+    let mut all_jvm = jvm_args;
+    all_jvm.append(&mut final_jvm);
+
+    // Filter out any raw -cp / -classpath from profile jvm args so we emit
+    // exactly one -cp <classpath> right before the mainClass.
+    let mut clean_jvm = Vec::new();
+    let mut skip_next = false;
+    for arg in &all_jvm {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg == "-cp" || arg == "-classpath" {
+            skip_next = true;
+            continue;
+        }
+        clean_jvm.push(arg.clone());
+    }
+
+    for extra in custom_jvm_args.split_whitespace() {
+        if !extra.is_empty() {
+            clean_jvm.push(extra.to_string());
+        }
+    }
 
     let mut final_game: Vec<String> = game_args.iter().map(|a| substitute(a, &vars)).collect();
 
@@ -671,16 +746,20 @@ pub fn build_launch_spec(
         .unwrap_or_else(|| "cpw.mods.bootstraplauncher.BootstrapLauncher".into());
 
     let mut args: Vec<String> = Vec::new();
-    args.extend(final_jvm);
+    args.extend(clean_jvm);
     args.push("-cp".to_string());
     args.push(classpath_joined.clone());
     args.push(main_class);
     args.extend(final_game);
 
+    // `JAVA_HOME` must point at a real JDK root. For `/usr/bin/java` (the
+    // macOS stub) `bin/..` is `/usr`, which is not a JDK home — check for the
+    // `release` marker file every JDK ships at its root before using it.
     let java_home = java
         .path
         .parent()
         .and_then(|p| p.parent())
+        .filter(|p| p.join("release").is_file())
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
 
@@ -753,26 +832,51 @@ mod tests {
 
     #[test]
     fn rules_filter() {
-        // On Linux a lib disallowed only on windows applies.
-        let lib: VerLibrary = serde_json::from_str(
-            r#"{"name":"a:b:1","rules":[{"action":"disallow","os":{"name":"windows"}}]}"#,
-        )
+        let os = current_os_name();
+        // A lib disallowed on some *other* OS always applies here.
+        let other_os = if os == "windows" { "linux" } else { "windows" };
+        let lib: VerLibrary = serde_json::from_str(&format!(
+            r#"{{"name":"a:b:1","rules":[{{"action":"disallow","os":{{"name":"{other_os}"}}}}]}}"#
+        ))
         .unwrap();
         assert!(lib.applies_to_current_os());
-        // A lib forbidden on linux does not apply here.
-        let lib2: VerLibrary = serde_json::from_str(
-            r#"{"name":"a:b:1","rules":[{"action":"disallow","os":{"name":"linux"}}]}"#,
-        )
+        // A lib forbidden on the current OS does not apply.
+        let lib2: VerLibrary = serde_json::from_str(&format!(
+            r#"{{"name":"a:b:1","rules":[{{"action":"disallow","os":{{"name":"{os}"}}}}]}}"#
+        ))
         .unwrap();
         assert!(!lib2.applies_to_current_os());
     }
 
     #[test]
     fn substitution() {
-        let vars = vec![("auth_player_name", "Tester")];
+        let vars = vec![
+            ("auth_player_name", "Tester"),
+            ("library_directory", "/custom/libs"),
+        ];
         assert_eq!(
             substitute("--username ${auth_player_name}", &vars),
             "--username Tester"
         );
+        assert_eq!(
+            substitute("-DlibraryDirectory=${library_directory}", &vars),
+            "-DlibraryDirectory=/custom/libs"
+        );
+    }
+
+    #[test]
+    fn evaluate_args_rules() {
+        let os = current_os_name();
+        let other_os = if os == "osx" { "windows" } else { "osx" };
+        let json: Vec<serde_json::Value> = serde_json::from_str(&format!(
+            r#"[
+                "-Dsimple=1",
+                {{"rules": [{{"action": "allow", "os": {{"name": "{os}"}}}}], "value": ["-Xmatching"]}},
+                {{"rules": [{{"action": "allow", "os": {{"name": "{other_os}"}}}}], "value": ["-Xother"]}}
+            ]"#
+        )).unwrap();
+
+        let evaluated = evaluate_arguments(&json);
+        assert_eq!(evaluated, vec!["-Dsimple=1", "-Xmatching"]);
     }
 }

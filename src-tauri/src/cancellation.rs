@@ -16,6 +16,9 @@ impl CancelToken {
     pub fn cancel(&self) {
         self.0.store(true, Ordering::Release);
     }
+    pub fn reset(&self) {
+        self.0.store(false, Ordering::Release);
+    }
     pub fn is_canceled(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }

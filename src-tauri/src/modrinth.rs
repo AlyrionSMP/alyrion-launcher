@@ -50,6 +50,9 @@ pub struct PackVersion {
     pub version_type: String,
     #[serde(rename = "date_published")]
     pub date_published: String,
+    /// Release notes in Markdown, as published on Modrinth.
+    #[serde(default)]
+    pub changelog: Option<String>,
     pub files: Vec<ModrinthFile>,
 }
 
@@ -71,10 +74,16 @@ pub async fn fetch_latest_version(client: &reqwest::Client) -> Result<PackVersio
         )));
     }
     let versions: Vec<PackVersion> = resp.json().await?;
-    versions
-        .into_iter()
-        // Prefer release, then beta, then alpha; newest first from the API.
-        .find(|v| v.version_type == "release" || v.version_type == "beta")
+    let mut best = None;
+    for v in &versions {
+        if v.version_type == "release" {
+            best = Some(v.clone());
+            break;
+        } else if v.version_type == "beta" && best.is_none() {
+            best = Some(v.clone());
+        }
+    }
+    best.or_else(|| versions.into_iter().next())
         .ok_or_else(|| ModrinthError::Invalid("no usable version found".into()))
 }
 
@@ -90,6 +99,7 @@ mod tests {
           "version_number":"7.4.0",
           "version_type":"release",
           "date_published":"2026-06-07T15:02:08.102761Z",
+          "changelog":"line one\nline two",
           "files":[{"hashes":{"sha1":"abc","sha512":"def"},"url":"https://cdn.modrinth.com/x","filename":"Alyrion-7.4.0.mrpack","primary":true,"size":49042743}]
         }"#;
         let v: PackVersion = serde_json::from_str(json).unwrap();

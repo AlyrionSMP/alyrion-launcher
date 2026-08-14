@@ -23,14 +23,14 @@
         "transparent": true,
         "shadow": true,
         "theme": "Dark",
-        "backgroundColor": "#0b0e13"
+        "backgroundColor": "#0e1013"
       }
     ],
     "security": {
       "csp": null
     },
     "withGlobalTauri": false,
-    "macOSPrivateApi": false
+    "macOSPrivateApi": true
   },
   "bundle": {
     "active": true,
@@ -38,7 +38,13 @@
     "category": "Game",
     "shortDescription": "Launcher for the Alyrion VII modpack",
     "longDescription": "Alyrion Launcher is the official launcher for the Alyrion VII Minecraft modpack. It installs, auto-updates and launches the exact latest version of the pack — nothing else.",
-    "icon": ["icons/icon.png"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
     "windows": {
       "wix": {
         "language": ["en-US"]

@@ -5,10 +5,13 @@
 //! Play is only possible from the `Ready` phase — never while an update is
 //! in flight.
 
+#![allow(dead_code, unused_imports)]
+
 mod accounts;
 mod cancellation;
 mod game;
 mod install;
+mod java;
 mod jobs;
 mod maven;
 mod modrinth;
@@ -40,6 +43,7 @@ struct Ctx {
     update_lock: Arc<Mutex<bool>>,
     cancel: cancellation::CancelToken,
     accounts: Arc<Mutex<Vec<accounts::Account>>>,
+    game_child: Arc<Mutex<Option<std::process::Child>>>,
 }
 
 impl Ctx {
@@ -50,13 +54,21 @@ impl Ctx {
             .build()
             .expect("reqwest client");
         let accounts = accounts::load_accounts(&base_dir);
+        let shared = SharedState::new();
+        if let Ok(j) = java::find_java(&base_dir) {
+            shared.set_java(Some(state::JavaInfoUi {
+                major: j.major,
+                path: j.path.to_string_lossy().to_string(),
+            }));
+        }
         Ctx {
-            shared: SharedState::new(),
+            shared,
             base_dir,
             client,
             update_lock: Arc::new(Mutex::new(false)),
             cancel: cancellation::CancelToken::new(),
             accounts: Arc::new(Mutex::new(accounts)),
+            game_child: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -89,6 +101,7 @@ async fn start_update(app: tauri::AppHandle) -> Result<(), String> {
     let client = ctx.client.clone();
     let shared = ctx.shared.clone();
     let cancel = ctx.cancel.clone();
+    cancel.reset();
     let app_for_lock = app.clone();
 
     shared.set_phase(Phase::Checking);
@@ -101,6 +114,12 @@ async fn start_update(app: tauri::AppHandle) -> Result<(), String> {
         .await;
         match outcome {
             Ok(outcome) => {
+                if let Ok(j) = java::find_java(&base) {
+                    shared.set_java(Some(state::JavaInfoUi {
+                        major: j.major,
+                        path: j.path.to_string_lossy().to_string(),
+                    }));
+                }
                 shared.set_installed(Some(state::InstalledInfo {
                     version_number: outcome.version().to_string(),
                     version_id: outcome.version_id().to_string(),
@@ -130,6 +149,21 @@ fn cancel_update(app: tauri::AppHandle) -> Result<(), String> {
     let ctx = app.state::<Ctx>();
     ctx.cancel.cancel();
     Ok(())
+}
+
+/// Latest pack version metadata + changelog (Markdown) for the news panel.
+#[tauri::command]
+async fn latest_changelog(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let ctx = app.state::<Ctx>();
+    let v = modrinth::fetch_latest_version(&ctx.client)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "version_number": v.version_number,
+        "version_type": v.version_type,
+        "date_published": v.date_published,
+        "changelog": v.changelog.unwrap_or_default(),
+    }))
 }
 
 /// List saved accounts (username + provider only — never tokens).
@@ -235,9 +269,22 @@ fn logout(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn get_settings(app: tauri::AppHandle) -> Result<accounts::Settings, String> {
+    let ctx = app.state::<Ctx>();
+    Ok(accounts::load_settings(&ctx.base_dir))
+}
+
+#[tauri::command]
+fn save_settings(app: tauri::AppHandle, settings: accounts::Settings) -> Result<(), String> {
+    let ctx = app.state::<Ctx>();
+    accounts::save_settings(&ctx.base_dir, &settings).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Launch the game. Only valid in `Ready`, only with a selected account.
 #[tauri::command]
-fn play(app: tauri::AppHandle) -> Result<(), String> {
+async fn play(app: tauri::AppHandle) -> Result<(), String> {
     let ctx = app.state::<Ctx>();
     let shared = ctx.shared.clone();
     if !shared.can_play() {
@@ -251,14 +298,10 @@ fn play(app: tauri::AppHandle) -> Result<(), String> {
         .clone()
         .ok_or_else(|| "log in first (Offline, LittleSkin or Ely.by)".to_string())?;
 
-    shared.set_phase(Phase::Launching);
-    shared.set_game_running(true);
-
+    // Resolve everything fallible *before* mutating state, so a failure
+    // (missing Java, broken instance, …) can never leave the UI stuck on
+    // "Preparing launch…" with play permanently disabled.
     let java = game::find_java(&ctx.base_dir).map_err(|e| e.to_string())?;
-    shared.set_java(Some(state::JavaInfoUi {
-        major: java.major,
-        path: java.path.to_string_lossy().to_string(),
-    }));
 
     // Look up the account to get the full access token.
     let acc = {
@@ -269,6 +312,28 @@ fn play(app: tauri::AppHandle) -> Result<(), String> {
     };
     let acc = acc.unwrap_or_else(|| accounts::make_offline(&session.username));
 
+    shared.set_phase(Phase::Launching);
+    shared.set_game_running(true);
+    shared.set_java(Some(state::JavaInfoUi {
+        major: java.major,
+        path: java.path.to_string_lossy().to_string(),
+    }));
+
+    // Ensure all libraries and natives are present on disk before launching.
+    let layout = game::InstanceLayout::new(&ctx.base_dir);
+    if let (Ok(vanilla), Some(profile)) = (
+        game::read_version_json(&layout, game::MC_VERSION),
+        game::find_installed_neoforge_profile(&layout),
+    ) {
+        if let Ok(neoforge) = game::read_version_json(&layout, &profile) {
+            let merged = game::merged_libraries(&vanilla, &neoforge);
+            let dummy_cancel = std::sync::atomic::AtomicBool::new(false);
+            let _ = game::sync_libraries(&ctx.client, &layout, &merged, &dummy_cancel, |_, _| {}).await;
+            let _ = game::extract_natives(&layout, &merged);
+        }
+    }
+
+    let settings = accounts::load_settings(&ctx.base_dir);
     let spec = game::build_launch_spec(
         &ctx.base_dir,
         &java,
@@ -284,20 +349,25 @@ fn play(app: tauri::AppHandle) -> Result<(), String> {
                     Some(accounts::ELYBY_AUTHSERVER.to_string())
                 }
                 accounts::Provider::LittleSkin => {
-                    let s = accounts::load_settings(&ctx.base_dir);
-                    Some(s.littleskin_server)
+                    Some(settings.littleskin_server.clone())
                 }
                 accounts::Provider::Offline => None,
             },
         },
-        4096,
+        settings.allocated_memory_mb,
+        &settings.jvm_args,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| {
+        shared.set_game_running(false);
+        shared.set_phase(Phase::Ready);
+        e.to_string()
+    })?;
 
     match game::spawn_game(&spec, None) {
         Ok(child) => {
             shared.set_phase(Phase::Running);
-            jobs::spawn_proc_watcher(child, move || {
+            *ctx.game_child.lock().unwrap() = Some(child);
+            jobs::spawn_proc_watcher(ctx.game_child.clone(), move || {
                 shared.set_game_running(false);
                 if shared.inner.lock().unwrap().phase == Phase::Running {
                     shared.set_phase(Phase::Ready);
@@ -310,6 +380,17 @@ fn play(app: tauri::AppHandle) -> Result<(), String> {
             shared.set_phase(Phase::Error);
             return Err(e.to_string());
         }
+    }
+    Ok(())
+}
+
+/// Terminate the running game process if active.
+#[tauri::command]
+fn kill_game(app: tauri::AppHandle) -> Result<(), String> {
+    let ctx = app.state::<Ctx>();
+    let mut lock = ctx.game_child.lock().unwrap();
+    if let Some(child) = lock.as_mut() {
+        let _ = child.kill();
     }
     Ok(())
 }
@@ -386,12 +467,16 @@ pub fn run() {
             state_snapshot,
             start_update,
             cancel_update,
+            latest_changelog,
             play,
+            kill_game,
             list_accounts,
             login_offline,
             login_littleskin,
             login_elyby,
-            logout
+            logout,
+            get_settings,
+            save_settings
         ])
         .setup(|app| {
             app.manage(Ctx::new(resolve_data_dir(app)));

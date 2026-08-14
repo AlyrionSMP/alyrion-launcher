@@ -55,21 +55,32 @@ impl Jobs {
     }
 }
 
-/// Spawn a "fence" thread that waits for a child process and flips a flag.
+/// Spawn a watcher thread that periodically checks the child process exit and invokes on_finish.
 pub fn spawn_proc_watcher(
-    mut child: std::process::Child,
+    child_arc: Arc<Mutex<Option<std::process::Child>>>,
     on_finish: impl Fn() + Send + 'static,
 ) {
     std::thread::spawn(move || {
-        let _ = child.wait();
-        // Give a grace period so any final log flush lands.
+        loop {
+            std::thread::sleep(Duration::from_millis(150));
+            let mut lock = child_arc.lock().unwrap();
+            if let Some(child) = lock.as_mut() {
+                match child.try_wait() {
+                    Ok(Some(_status)) => {
+                        *lock = None;
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        *lock = None;
+                        break;
+                    }
+                }
+            } else {
+                break;
+            }
+        }
         std::thread::sleep(Duration::from_millis(100));
         on_finish();
     });
-}
-
-/// Poll a child process handle for exit (for the run loop that needs to
-/// observe while also servicing commands).
-pub fn try_wait(child: &mut std::process::Child) -> Option<i32> {
-    child.try_wait().ok().flatten().map(|s| s.code().unwrap_or(-1))
 }

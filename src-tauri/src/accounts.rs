@@ -4,7 +4,6 @@
 //! once over HTTPS to the chosen auth server.
 
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,15 +358,43 @@ pub fn load_settings(base_dir: &std::path::Path) -> Settings {
         .unwrap_or_default()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     /// LittleSkin Yggdrasil server base.
     #[serde(default = "default_littleskin_server")]
     pub littleskin_server: String,
+    /// Allocated RAM in megabytes.
+    #[serde(default = "default_allocated_memory_mb")]
+    pub allocated_memory_mb: u32,
+    /// Custom extra JVM arguments.
+    #[serde(default)]
+    pub jvm_args: String,
 }
 
-fn default_littleskin_server() -> String {
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            littleskin_server: default_littleskin_server(),
+            allocated_memory_mb: default_allocated_memory_mb(),
+            jvm_args: String::new(),
+        }
+    }
+}
+
+pub fn default_allocated_memory_mb() -> u32 {
+    4096
+}
+
+pub fn default_littleskin_server() -> String {
     "https://littleskin.cn/api/yggdrasil".to_string()
+}
+
+/// Persist settings.json to disk.
+pub fn save_settings(base_dir: &std::path::Path, settings: &Settings) -> Result<(), AuthError> {
+    let path = base_dir.join("settings.json");
+    let text = serde_json::to_string_pretty(settings)?;
+    std::fs::write(path, text)?;
+    Ok(())
 }
 
 /// Load accounts from disk.
