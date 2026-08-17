@@ -92,20 +92,27 @@ pub struct OsMatch {
     pub arch: Option<String>,
 }
 
+/// Optional launcher features never engaged by this launcher. Any argument
+/// gated behind a `true` feature — quick play (`--quickPlaySingleplayer`,
+/// `--quickPlayPath`, …), demo mode (`--demo`), custom resolution
+/// (`--width/--height`) — must be dropped from the launch, and a feature
+/// marked `false` matches precisely because the feature is not enabled.
+const ENABLED_FEATURES: &[&str] = &[];
+
 fn evaluate_rules(rules: &[Rule]) -> bool {
     if rules.is_empty() {
         return true;
     }
     let os = current_os_name();
     let arch = current_os_arch();
-    // If there is any 'allow' rule without custom features, default is false (opt-in).
-    // If all rules are 'disallow', default is true (opt-out).
-    let mut decision = !rules.iter().any(|r| r.action == "allow" && r.features.is_none());
+    // Feature-gated rule sets (quick play, demo mode, custom resolution) are
+    // opt-in: with no enabled feature they never apply.
+    let feature_opt_in = rules.iter().any(|r| r.features.is_some());
+    // Plain OS rules: opt-in sets (`[allow os:X]`) need a match; opt-out sets
+    // (`[disallow os:X]`) apply everywhere else.
+    let mut decision = !feature_opt_in && !rules.iter().any(|r| r.action == "allow");
     for r in rules {
-        if r.features.is_some() {
-            continue;
-        }
-        let matched = match &r.os {
+        let os_ok = match &r.os {
             Some(osm) => {
                 let os_ok = osm.name.as_deref().map(|n| n == os).unwrap_or(true);
                 let arch_ok = osm.arch.as_deref().map(|a| a == arch).unwrap_or(true);
@@ -113,7 +120,19 @@ fn evaluate_rules(rules: &[Rule]) -> bool {
             }
             None => true,
         };
-        if matched {
+        let feats_ok = match &r.features {
+            Some(feats) => feats
+                .as_object()
+                .map(|m| {
+                    m.iter()
+                        .all(|(name, want)| ENABLED_FEATURES.contains(&name.as_str()) == want.as_bool().unwrap_or(false))
+                })
+                .unwrap_or(false),
+            None => true,
+        };
+        // Last matching rule wins; if nothing matches the argument is not
+        // applicable and must not be emitted.
+        if os_ok && feats_ok {
             decision = r.action == "allow";
         }
     }
@@ -846,6 +865,49 @@ mod tests {
         ))
         .unwrap();
         assert!(!lib2.applies_to_current_os());
+    }
+
+    #[test]
+    fn quick_play_rules_are_excluded() {
+        // These are the exact rule declarations from the vanilla 1.21.1 json.
+        // Without an enabled `is_quick_play_*` feature the args must be absent,
+        // otherwise the game boots straight into
+        // "Failed to Quick Play: Could not find world with the provided identifier".
+        for json in [
+            r#"[{"action":"allow","features":{"has_quick_plays_support":true}}]"#,
+            r#"[{"action":"allow","features":{"is_quick_play_singleplayer":true}}]"#,
+            r#"[{"action":"allow","features":{"is_quick_play_multiplayer":true}}]"#,
+            r#"[{"action":"allow","features":{"is_quick_play_realms":true}}]"#,
+        ] {
+            let rules: Vec<Rule> = serde_json::from_str(json).unwrap();
+            assert!(!evaluate_rules(&rules), "must not apply: {json}");
+        }
+        assert!(!evaluate_arguments(&serde_json::from_str::<Vec<serde_json::Value>>(r#"[
+            {"rules":[{"action":"allow","features":{"is_quick_play_singleplayer":true}}],
+             "value":["--quickPlaySingleplayer","${quickPlaySingleplayer}"]}
+        ]"#).unwrap()).contains(&"--quickPlaySingleplayer".to_string()));
+    }
+
+    #[test]
+    fn demo_and_custom_resolution_rules_are_excluded() {
+        let rules: Vec<Rule> =
+            serde_json::from_str(r#"[{"action":"allow","features":{"is_demo_user":true}}]"#).unwrap();
+        assert!(!evaluate_rules(&rules));
+        let rules: Vec<Rule> =
+            serde_json::from_str(r#"[{"action":"allow","features":{"has_custom_resolution":true}}]"#)
+                .unwrap();
+        assert!(!evaluate_rules(&rules));
+    }
+
+    #[test]
+    fn negated_feature_rule_matches_when_feature_absent() {
+        // `"feature": false` means "include when the feature is NOT enabled",
+        // which is exactly our state for every optional feature.
+        let rules: Vec<Rule> = serde_json::from_str(
+            r#"[{"action":"allow","features":{"is_quick_play_singleplayer":false}}]"#,
+        )
+        .unwrap();
+        assert!(evaluate_rules(&rules));
     }
 
     #[test]

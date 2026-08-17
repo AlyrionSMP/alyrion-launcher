@@ -63,7 +63,11 @@ impl PackVersion {
     }
 }
 
-/// Fetches the latest released version of the Alyrion modpack.
+/// Fetches the latest version of the Alyrion modpack.
+///
+/// The Modrinth `/version` endpoint returns versions newest-first, so the
+/// first entry of any standard type (`release`/`beta`/`alpha`/`gamma`) is
+/// the newest usable pack. Experimental or junk versions are left alone.
 pub async fn fetch_latest_version(client: &reqwest::Client) -> Result<PackVersion, ModrinthError> {
     let url = format!("{API_ROOT}/project/{PACK_PROJECT_ID}/version");
     let resp = client.get(&url).send().await?;
@@ -74,16 +78,9 @@ pub async fn fetch_latest_version(client: &reqwest::Client) -> Result<PackVersio
         )));
     }
     let versions: Vec<PackVersion> = resp.json().await?;
-    let mut best = None;
-    for v in &versions {
-        if v.version_type == "release" {
-            best = Some(v.clone());
-            break;
-        } else if v.version_type == "beta" && best.is_none() {
-            best = Some(v.clone());
-        }
-    }
-    best.or_else(|| versions.into_iter().next())
+    versions
+        .into_iter()
+        .find(|v| matches!(v.version_type.as_str(), "release" | "beta" | "alpha" | "gamma"))
         .ok_or_else(|| ModrinthError::Invalid("no usable version found".into()))
 }
 

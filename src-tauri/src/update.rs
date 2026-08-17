@@ -19,6 +19,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -556,26 +557,189 @@ pub async fn ensure_neoforge_installed(
     fs::create_dir_all(staging_dir.join("versions"))?;
     fs::create_dir_all(staging_dir.join("libraries"))?;
 
-    let output = std::process::Command::new(&java.path)
-        .current_dir(staging_dir)
-        .arg("-jar")
-        .arg(&installer_path)
-        .arg("--installClient")
-        .arg(staging_dir)
-        .output()
-        .map_err(UpdateError::Io)?;
+    // Run the installer as a child process and stream its output so the UI
+    // keeps showing live progress. The installer silently downloads several
+    // hundred MB of libraries, and a plain blocking `Command::output()` would
+    // freeze the update on a no-progress "Installing NeoForge …" message for
+    // the whole duration — and hang forever if the JVM keeps the output pipes
+    // open after exiting.
+    let install_log = cache_dir.join(format!("neoforge-{neoforge_ver}-install.log"));
+    let mut log_file = fs::File::create(&install_log)?;
+    let mut tail: Vec<String> = Vec::new();
+    let mut last_emit = Instant::now();
+    let mut lines_seen = 0u64;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+    let run_result = run_neoforge_installer(java, &installer_path, staging_dir, cancel, |line| {
+        let line = line.trim_end();
+        let _ = writeln!(log_file, "{line}");
+        if line.is_empty() {
+            return;
+        }
+        tail.push(line.to_string());
+        if tail.len() > INSTALLER_TAIL_LINES {
+            tail.remove(0);
+        }
+        lines_seen += 1;
+        // Throttle UI updates; the installer can print many lines per second.
+        if last_emit.elapsed() >= INSTALLER_EMIT_INTERVAL || lines_seen.is_multiple_of(25) {
+            last_emit = Instant::now();
+            let detail = truncate_for_display(line);
+            progress(Progress {
+                stage: UpdateStage::Extracting,
+                fraction: (0.5 + lines_seen as f32 * 0.0005).min(0.95),
+                detail: format!("Installing NeoForge {neoforge_ver} runtime… {detail}"),
+            });
+        }
+    })
+    .await;
+
+    if let Err(e) = run_result {
+        let tail_text = tail.join("\n");
+        return Err(match e {
+            UpdateError::Canceled => UpdateError::Canceled,
+            UpdateError::Integrity(msg) => UpdateError::Integrity(format!(
+                "{msg}\nLast installer output:\n{tail_text}"
+            )),
+            other => other,
+        });
+    }
+
+    if !staging_profile_json.is_file() {
         return Err(UpdateError::Integrity(format!(
-            "NeoForge installer failed (exit code {:?}):\n{}\n{}",
-            output.status.code(),
-            stderr.trim(),
-            stdout.trim()
+            "NeoForge installer finished but produced no profile {} — see {}",
+            staging_profile_json.display(),
+            install_log.display()
         )));
     }
 
+    // The installer writes its own log into its working directory.
+    let _ = fs::remove_file(staging_dir.join("nf-installer.jar.log"));
+
+    progress(Progress {
+        stage: UpdateStage::Verifying,
+        fraction: 0.96,
+        detail: format!("NeoForge {neoforge_ver} runtime installed, syncing game files…"),
+    });
+
+    Ok(())
+}
+
+/// How long the NeoForge installer may stay silent before we kill it.
+/// The installer is talkative while working, so silence for this long means
+/// it is hung (e.g. a blocked CDN) rather than busy.
+const INSTALLER_IDLE_TIMEOUT: Duration = Duration::from_secs(900);
+/// Lines of installer output kept for error reporting.
+const INSTALLER_TAIL_LINES: usize = 40;
+/// Minimum gap between live progress updates while streaming installer output.
+const INSTALLER_EMIT_INTERVAL: Duration = Duration::from_millis(250);
+
+fn truncate_for_display(line: &str) -> String {
+    if line.chars().count() > 90 {
+        let mut s: String = line.chars().take(90).collect();
+        s.push('…');
+        s
+    } else {
+        line.to_string()
+    }
+}
+
+/// Run the NeoForge installer headless, streaming its stdout/stderr to
+/// `on_line` until it exits. The installer is killed if `cancel` is set or if
+/// it produces no output for `INSTALLER_IDLE_TIMEOUT`.
+async fn run_neoforge_installer(
+    java: &crate::java::JavaInfo,
+    installer_path: &Path,
+    staging_dir: &Path,
+    cancel: &AtomicBool,
+    mut on_line: impl FnMut(&str),
+) -> Result<(), UpdateError> {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let mut child = tokio::process::Command::new(&java.path)
+        .current_dir(staging_dir)
+        .arg("-jar")
+        .arg(installer_path)
+        .arg("--installClient")
+        .arg(staging_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(UpdateError::Io)?;
+
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout piped")).lines();
+    let mut stderr = BufReader::new(child.stderr.take().expect("stderr piped")).lines();
+    let mut eof_streams = 0;
+    let mut exited: Option<std::process::ExitStatus> = None;
+    let mut last_activity = Instant::now();
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = tick.tick() => {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    return Err(UpdateError::Canceled);
+                }
+                if let Some(status) = child.try_wait().map_err(UpdateError::Io)? {
+                    exited = Some(status);
+                    last_activity = Instant::now();
+                    continue;
+                }
+                if last_activity.elapsed() >= INSTALLER_IDLE_TIMEOUT {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    return Err(UpdateError::Integrity(format!(
+                        "NeoForge installer produced no output for {} seconds and was killed. \
+                         Its downloads from maven.neoforged.net / libraries.minecraft.net may be blocked.",
+                        INSTALLER_IDLE_TIMEOUT.as_secs()
+                    )));
+                }
+            }
+            line = stdout.next_line() => {
+                match line {
+                    Ok(Some(l)) => {
+                        on_line(&l);
+                        last_activity = Instant::now();
+                    }
+                    Ok(None) => eof_streams += 1,
+                    Err(e) => {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        return Err(UpdateError::Io(e));
+                    }
+                }
+            }
+            line = stderr.next_line() => {
+                match line {
+                    Ok(Some(l)) => {
+                        on_line(&l);
+                        last_activity = Instant::now();
+                    }
+                    Ok(None) => eof_streams += 1,
+                    Err(e) => {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        return Err(UpdateError::Io(e));
+                    }
+                }
+            }
+        }
+
+        if exited.is_some() && eof_streams >= 2 {
+            break;
+        }
+    }
+
+    let status = exited.expect("loop breaks only after the installer has exited");
+    if !status.success() {
+        return Err(UpdateError::Integrity(format!(
+            "NeoForge installer failed (exit code {:?})",
+            status.code()
+        )));
+    }
     Ok(())
 }
 
@@ -711,13 +875,27 @@ pub async fn update_pack(
 
     if let Ok(vanilla) = crate::game::read_version_json(&layout, crate::game::MC_VERSION) {
         if let Some(asset_index) = &vanilla.asset_index {
-            let _ = crate::game::sync_assets(client, &layout, asset_index, cancel, |_, _| {}).await;
+            let _ = crate::game::sync_assets(client, &layout, asset_index, cancel, |frac, detail| {
+                progress(Progress {
+                    stage: UpdateStage::Verifying,
+                    fraction: frac,
+                    detail: detail.into(),
+                });
+            })
+            .await;
         }
         let profile = crate::game::find_installed_neoforge_profile(&layout)
             .unwrap_or_else(|| format!("neoforge-{neoforge_ver}"));
         if let Ok(neoforge) = crate::game::read_version_json(&layout, &profile) {
             let merged = crate::game::merged_libraries(&vanilla, &neoforge);
-            let _ = crate::game::sync_libraries(client, &layout, &merged, cancel, |_, _| {}).await;
+            let _ = crate::game::sync_libraries(client, &layout, &merged, cancel, |frac, detail| {
+                progress(Progress {
+                    stage: UpdateStage::Verifying,
+                    fraction: frac,
+                    detail: detail.into(),
+                });
+            })
+            .await;
             let _ = crate::game::extract_natives(&layout, &merged);
         }
     }
