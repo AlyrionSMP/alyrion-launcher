@@ -472,12 +472,25 @@ pub async fn ensure_neoforge_installed(
     mut progress: impl FnMut(Progress),
 ) -> Result<(), UpdateError> {
     let profile = format!("neoforge-{neoforge_ver}");
-    let staging_profile_json = staging_dir
-        .join("versions")
+    let staging_layout = crate::game::InstanceLayout {
+        root: staging_dir.to_path_buf(),
+        versions: staging_dir.join("versions"),
+        libraries: staging_dir.join("libraries"),
+        assets: staging_dir.join("assets"),
+        indexes: staging_dir.join("assets").join("indexes"),
+        objects: staging_dir.join("assets").join("objects"),
+        logs: staging_dir.join("logs"),
+        natives: staging_dir
+            .join("versions")
+            .join(crate::game::MC_VERSION)
+            .join(format!("{}-natives", crate::game::MC_VERSION)),
+    };
+    let staging_profile_json = staging_layout
+        .versions
         .join(&profile)
         .join(format!("{profile}.json"));
 
-    if staging_profile_json.is_file() {
+    if crate::game::version_profile_ok(&staging_layout, &profile) {
         return Ok(());
     }
 
@@ -487,7 +500,10 @@ pub async fn ensure_neoforge_installed(
         .join(&profile)
         .join(format!("{profile}.json"));
 
-    if live_profile_json.is_file() {
+    if crate::game::version_profile_ok(
+        &crate::game::InstanceLayout::new(base_dir),
+        &profile,
+    ) {
         for sub in ["versions", "libraries", "assets"] {
             let src = live_dir.join(sub);
             let dst = staging_dir.join(sub);
@@ -495,9 +511,13 @@ pub async fn ensure_neoforge_installed(
                 let _ = copy_dir_recursive(&src, &dst);
             }
         }
-        if staging_profile_json.is_file() {
+        if crate::game::version_profile_ok(&staging_layout, &profile) {
             return Ok(());
         }
+    } else if live_profile_json.is_file() {
+        // A profile that exists but does not parse is corruption from a
+        // killed install — drop it so it can never be copied forward again.
+        let _ = fs::remove_dir_all(live_profile_json.parent().unwrap());
     }
 
     progress(Progress {
@@ -768,7 +788,9 @@ pub async fn update_pack(
     // Java 21+: ensure a runtime is present (downloads Temurin 21 if not found on system)
     let java_info = crate::java::ensure_java(client, base_dir, cancel, &mut progress).await?;
 
-    // Early check: if the instance is already installed with this exact version and NeoForge profile is intact, return immediately.
+    // Early check: if the instance is already installed with this exact version,
+    // NeoForge profile is intact AND the vanilla profile parses (guards against
+    // empty/corrupt json from a killed install), return immediately.
     let live = base_dir.join("instance");
     let previous_version = read_installed_version(&live);
     let layout = crate::game::InstanceLayout::new(base_dir);
@@ -776,6 +798,7 @@ pub async fn update_pack(
 
     if previous_version.as_deref() == Some(latest.id.as_str())
         && neoforge_installed
+        && crate::game::version_profile_ok(&layout, crate::game::MC_VERSION)
         && live.join("mods").is_dir()
     {
         progress(Progress {
@@ -900,7 +923,10 @@ pub async fn update_pack(
         }
     }
 
-    // Carry over user data and runtime caches from the previous install.
+    // Carry over user data from the previous install. Runtime trees
+    // (versions/libraries/assets) are NOT carried over: staging already has
+    // a freshly built, verified set, and copying the old one over it would
+    // resurrect corrupt files from a broken previous install.
     let live = base_dir.join("instance");
     let mut preserved: Vec<(String, PathBuf)> = Vec::new();
     if live.exists() {
@@ -908,9 +934,6 @@ pub async fn update_pack(
             "worlds",
             "screenshots",
             "resourcepacks",
-            "versions",
-            "libraries",
-            "assets",
             "launcher_profiles.json",
         ] {
             let p = live.join(sub);

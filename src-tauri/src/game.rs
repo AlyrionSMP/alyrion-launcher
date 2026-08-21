@@ -280,6 +280,12 @@ pub fn read_version_json(layout: &InstanceLayout, profile: &str) -> Result<McVer
     Ok(serde_json::from_str(&text)?)
 }
 
+/// True when the profile json exists and parses — an empty or truncated file
+/// (e.g. from a killed install) must not count as an installed profile.
+pub fn version_profile_ok(layout: &InstanceLayout, profile: &str) -> bool {
+    read_version_json(layout, profile).is_ok()
+}
+
 /// All libraries that apply (merged across profiles), in launch order:
 /// vanilla first (deduped), then NeoForge additions.
 pub fn merged_libraries(
@@ -334,9 +340,15 @@ pub async fn sync_assets(
     fs::create_dir_all(&layout.indexes)?;
     fs::create_dir_all(&layout.objects)?;
 
-    // 1. Fetch the index file.
+    // 1. Fetch the index file (also when the existing one is corrupt — an
+    //    empty/truncated json from a killed install would otherwise crash).
     let idx_path = layout.indexes.join(format!("{}.json", index_json.id));
-    if !idx_path.is_file() {
+    let mut idx_text = fs::read_to_string(&idx_path).ok();
+    let idx_valid = idx_text
+        .as_deref()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+        .is_some();
+    if !idx_valid {
         let url = index_json
             .url
             .clone()
@@ -353,9 +365,9 @@ pub async fn sync_assets(
         )
         .await
         .map_err(|e| GameError::Assets(e.to_string()))?;
+        idx_text = Some(fs::read_to_string(&idx_path)?);
     }
-    let text = fs::read_to_string(&idx_path)?;
-    let idx: serde_json::Value = serde_json::from_str(&text)?;
+    let idx: serde_json::Value = serde_json::from_str(idx_text.as_deref().unwrap_or_default())?;
     let objects = idx
         .get("objects")
         .and_then(|o| o.as_object())
@@ -577,13 +589,13 @@ fn evaluate_arguments(args: &[serde_json::Value]) -> Vec<String> {
 }
 
 pub fn find_installed_neoforge_profile(layout: &InstanceLayout) -> Option<String> {
-    if layout.versions.join(NEOFORGE_PROFILE).join(format!("{NEOFORGE_PROFILE}.json")).is_file() {
+    if version_profile_ok(layout, NEOFORGE_PROFILE) {
         return Some(NEOFORGE_PROFILE.to_string());
     }
     if let Ok(entries) = fs::read_dir(&layout.versions) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("neoforge") && entry.path().join(format!("{name}.json")).is_file() {
+            if name.starts_with("neoforge") && version_profile_ok(layout, &name) {
                 return Some(name);
             }
         }
@@ -838,6 +850,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v.main_class.as_deref(), Some("a.B"));
+    }
+
+    #[test]
+    fn empty_profile_is_not_installed() {
+        // Regression: a 0-byte profile json (from a killed install) must not
+        // count as an installed NeoForge profile — it used to pass launch-time
+        // checks and then blow up with "json error: EOF while parsing a value".
+        let dir = std::env::temp_dir().join(format!("alyrion-test-{}", std::process::id()));
+        let layout = InstanceLayout {
+            root: dir.clone(),
+            versions: dir.join("versions"),
+            libraries: dir.join("libraries"),
+            assets: dir.join("assets"),
+            indexes: dir.join("assets").join("indexes"),
+            objects: dir.join("assets").join("objects"),
+            natives: dir.join("versions").join("1.21.1").join("natives"),
+            logs: dir.join("logs"),
+        };
+        let p = layout
+            .versions
+            .join(NEOFORGE_PROFILE)
+            .join(format!("{NEOFORGE_PROFILE}.json"));
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, b"").unwrap();
+        assert!(!version_profile_ok(&layout, NEOFORGE_PROFILE));
+        assert_eq!(find_installed_neoforge_profile(&layout), None);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
